@@ -28,7 +28,7 @@ class globalsetting:
     DISCOUNT_BY_BANK: bool = True
     INIT_W0_UNIFORM: bool = True
     BAND_SMOOTH_COEF: float = 0.0
-    TRADE_PEN_COEF: float = 0.4
+    TRADE_PEN_COEF: float = 0.0
     ALPHA: float = 1/5
     STAGE1_WIDTH_COEF: float = 0.05
 
@@ -86,6 +86,25 @@ def reflect_multi(S: np.ndarray,
         return S, max(0.0, C), sold_total
 
     w = S / Y
+    # ---- BUY up to A (free, limited by cash)
+    Y = S.sum() + C
+    w = S / (Y + 1e-30)
+
+    # iterate re-allocation until no progress
+    for _ in range(10):  # 10回も回せば十分
+        gaps = np.maximum(0.0, A - w)
+        need = gaps * Y
+        total_need = need.sum()
+        if total_need <= 1e-12 or C <= 1e-12:
+            break
+        spend = min(C, total_need)
+        buy_amt = need / (total_need + 1e-30) * spend
+        S += buy_amt
+        C -= float(buy_amt.sum())
+        # update
+        Y = S.sum() + C
+        w = S / (Y + 1e-30)
+
     gaps = np.maximum(0.0, A - w)
     need = gaps * Y                       # target dollar needed per asset
     total_need = need.sum()
@@ -97,6 +116,8 @@ def reflect_multi(S: np.ndarray,
     buy_amt = np.minimum(need, alloc * C) # ensure we don't exceed cash
     S += buy_amt
     C -= float(buy_amt.sum())
+    #w_after = S / (S.sum() + C + 1e-30)
+    #print("max A-gap", np.max(A - w_after), "max B-viol", np.max(w_after - B), "cash", C)
     return S, C, sold_total
 
 # ----------------------------
@@ -136,6 +157,10 @@ class GBMBandEnvMulti:
         self.A_prev = None; self.B_prev = None
 
     def _draw_z(self):
+        if getattr(self, "Z_path", None) is not None:
+            z = self.Z_path[self.z_ptr]
+            self.z_ptr += 1
+            return z
         eps = self.rng.standard_normal(self.N)
         return self.ChR @ eps
 
@@ -153,6 +178,8 @@ class GBMBandEnvMulti:
         self.lam  = (np.asarray(lam, dtype=float)
                      if isinstance(lam, (np.ndarray, list, tuple))
                      else float(lam))
+        self.Z_path = None if Z is None else np.asarray(Z, float)
+        self.z_ptr = 0
         # annual target return (discounted-by-bank). If None, use cfg default
         self.target_ret_ann = float(self.cfg.TARGET_RET_ANN if target_ret is None else target_ret)
         self.target_ret_dt  = self.target_ret_ann * self.dt
@@ -198,7 +225,9 @@ class GBMBandEnvMulti:
 
     def step(self, A: np.ndarray, B: np.ndarray, *, use_trade_penalty: bool=True):
 
-        A = clamp01_vec(A); B = np.maximum(A + 1e-6, B)
+        A = clamp01_vec(A)
+        B = clamp01_vec(B)
+        B = np.maximum(A + 1e-6, B)
         # smoothness penalty
         band_pen = 0.0
         if self.A_prev is not None and self.B_prev is not None:
@@ -221,7 +250,7 @@ class GBMBandEnvMulti:
         done = (self.t >= self.T)
         Y_next = self.S.sum() + self.C
 
-        # trade penalty
+        # additional trade penalty only for enhancing penalty for transactions, base transaction cost is already reflcted in wealth update
         trade_pen = 0.0
         if use_trade_penalty:
             lam_scalar = float(self.lam.mean()) if isinstance(self.lam, np.ndarray) else float(self.lam)
@@ -238,7 +267,7 @@ class GBMBandEnvMulti:
 
         # Model-implied drift used in the GBM step
         mu = self.r + (self.sigmas**2) * self.beta
-        mu_eff = mu - self.r if self.discount_by_bank else mu  # annualized log-drift
+        mu_eff = mu - self.r if self.discount_by_bank else mu
 
         # Per-step expected return and variance (small-dt approximation)
         mu_w_dt  = float(mu_eff @ w_mid) * self.dt
