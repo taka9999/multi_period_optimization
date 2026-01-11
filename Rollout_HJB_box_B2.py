@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Tuple
 
 from GBMEnv_LQ_v3 import GBMBandEnvMulti, globalsetting
 from RLopt_helpers import clamp01_vec
-from PPO_agent_v2 import JointBandPolicy, ValueNetCLS, PPOConfig
+from PPO_agent import JointBandPolicy, ValueNetCLS, PPOConfig
 
 
 def compute_gae(rews: torch.Tensor, vals: torch.Tensor, dones: torch.Tensor, gamma: float, lam: float) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -154,6 +154,60 @@ def compute_delta_box(
     lo, hi = clip
     return np.clip(delta, lo, hi)
 
+def compute_delta_rotated(
+    m_star: np.ndarray,
+    Cov: np.ndarray,
+    gamma: float,
+    lam: float,
+    *,
+    scale: float = 1.0,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build Level-B (U, delta_z) using eigendecomposition of a* = Q(m)CovQ(m).
+    delta_z_k ∝ (kappa * eig_a_k / Gamma_kk)^{1/3},
+    where Gamma_kk ≈ gamma * (U^T Cov U)_kk.
+
+    Returns (U, delta_z).
+    """
+    m_star = np.asarray(m_star, float).reshape(-1)
+    Cov = np.asarray(Cov, float)
+    N = m_star.size
+
+    kappa = max(0.0, 1.0 - float(lam))
+
+    # a* = Q Cov Q
+    Q = np.diag(m_star) - np.outer(m_star, m_star)
+    a = Q @ Cov @ Q
+    a = 0.5 * (a + a.T)
+
+    # eigh returns ascending eigenvalues; we want principal directions first
+    eigvals, U = np.linalg.eigh(a)
+    eigvals = np.maximum(eigvals, 0.0)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    U = U[:, order]
+
+    Cov_rot = U.T @ Cov @ U
+    Gamma_kk = np.maximum(eps, float(gamma) * np.maximum(eps, np.diag(Cov_rot)))
+
+    delta_z = scale * np.power((kappa * eigvals) / Gamma_kk, 1.0/3.0)
+    delta_z = np.maximum(0.0, delta_z)
+    return U, delta_z
+
+def apply_topk_s(s:np.ndarray, *, topk: int | None) -> np.ndarray:
+    s = np.asarray(s, dtype = float).reshape(-1)
+    if topk is None:
+        return s
+    k = int(topk)
+    if k <= 0:
+        return np.ones_like(s)
+    if k >= s.size:
+        return s
+    out = np.ones_like(s)
+    out[:k] = s[:k]
+    return out
+
 
 @torch.no_grad()
 def rollout_joint(policy: JointBandPolicy, valuef: ValueNetCLS, cfg: PPOConfig, *, gcfg: globalsetting, lam_choices: List[float], target_choices: Optional[List[float]] = None, stage: int = 2, batch_episodes: Optional[int] = None, R: Optional[np.ndarray] = None, mv_allow_cash: bool = True, mv_round_nd: int = 4, mv_solver: str = "OSQP",corr_mode:str = "full") -> Dict[str, torch.Tensor]:
@@ -265,3 +319,213 @@ def rollout_joint(policy: JointBandPolicy, valuef: ValueNetCLS, cfg: PPOConfig, 
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
     return dict(obs=obs, m=m, s=s, logp=logp, adv=adv, ret=ret, rew_ep_mean=float(np.mean(rew_ep)), rew_ep_std=float(np.std(rew_ep)))
+
+
+@torch.no_grad()
+def rollout_joint_levelB(
+    policy: JointBandPolicy,
+    valuef: ValueNetCLS,
+    cfg: PPOConfig,
+    *,
+    gcfg: globalsetting,
+    lam_choices: List[float],
+    target_choices: Optional[List[float]] = None,
+    batch_episodes: Optional[int] = None,
+    R: Optional[np.ndarray] = None,
+    mv_allow_cash: bool = True,
+    mv_round_nd: int = 4,
+    mv_solver: str = "OSQP",
+    qp_solver: str = "OSQP",
+    topk: int | None = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Stage-2 PPO batch collection under Level-B executor:
+      - center m* from MV-QP (same as rollout_joint)
+      - widths s from policy
+      - execute with rotated-box projection: env.step_rotated_box(m*, U, b_z)
+    Output batch matches ppo_update_joint expectations: obs, m, s, logp, adv, ret.
+    """
+    if R is None:
+        raise ValueError("rollout_joint_levelB: R must be provided")
+    be = cfg.batch_episodes if batch_episodes is None else int(batch_episodes)
+    N = gcfg.N_ASSETS
+
+    obs_buf, m_buf, s_buf, logp_buf, adv_buf, ret_buf = [], [], [], [], [], []
+    rew_ep = []
+
+    for _ in range(be):
+        beta = np.random.uniform(-0.95, 0.95, size=N)
+        lam = float(np.random.choice(lam_choices))
+        target_ann = (float(np.random.choice(target_choices))
+                      if (target_choices is not None and len(target_choices) > 0)
+                      else float(getattr(gcfg, "TARGET_RET_ANN", 0.06)))
+        target_ann = max(target_ann, 0.0)
+
+        env = make_env(gcfg, R)
+        obs = env.reset(beta=beta, lam=lam, target_ret=target_ann, w0=None)
+
+        # align to env-internal target
+        target_ann_eff = float(env.target_ret_ann)
+
+        # MV center (same as A2 rollout)
+        m_star = mv_center_qp(env.Cov, gcfg.sigmas, beta, target_ann_eff,
+                              allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
+
+        # rotated-basis prior computed ONCE per episode (fast + stable)
+        U, delta_z = compute_delta_rotated(
+            m_star=m_star,
+            Cov=env.Cov,
+            gamma=float(getattr(gcfg, "RISK_GAMMA", 1.0)),
+            lam=lam,
+            scale=1.0,
+        )
+
+        ep_obs, ep_m, ep_s, ep_lp, ep_val, ep_rew, ep_done = [], [], [], [], [], [], []
+        for t in range(env.T):
+            o = torch.tensor(obs, dtype=torch.float32, device=gcfg.device).unsqueeze(0)
+            v_t = valuef(o)
+
+            # sample s only (stage2)
+            s_t, logp_use, s_pre = policy.sample_s_only(o)
+            s_np = s_t.squeeze(0).detach().cpu().numpy()
+
+            s_eff = apply_topk_s(s_np, topk=topk)
+            b_z = 0.95 * s_eff * delta_z
+
+            obs, r, done, _ = env.step_rotated_box(
+                m=m_star, U=U, b_z=b_z,
+                allow_cash=mv_allow_cash,
+                solver=qp_solver,
+                use_trade_penalty=True,
+            )
+
+            ep_obs.append(o.squeeze(0).detach().cpu())
+            ep_m.append(torch.tensor(m_star, dtype=torch.float32))
+            ep_s.append(s_pre.squeeze(0).detach().cpu())
+            ep_lp.append(logp_use.squeeze(0).detach().cpu())
+            ep_val.append(v_t.squeeze(0).detach().cpu())
+            ep_rew.append(float(r))
+            ep_done.append(bool(done))
+            if done:
+                break
+
+        if len(ep_rew) == 0:
+            continue
+        rew_ep.append(float(np.sum(ep_rew)))
+
+        obs_ep = torch.stack(ep_obs)
+        m_ep   = torch.stack(ep_m)
+        s_ep   = torch.stack(ep_s)
+        lp_ep  = torch.stack(ep_lp)
+        val_ep = torch.stack(ep_val)
+        rew_t  = torch.tensor(ep_rew, dtype=torch.float32)
+        done_t = torch.tensor(ep_done, dtype=torch.bool)
+
+        adv_ep, ret_ep = compute_gae(rew_t, val_ep, done_t, cfg.gamma, cfg.gae_lambda)
+        obs_buf.append(obs_ep)
+        m_buf.append(m_ep)
+        s_buf.append(s_ep)
+        logp_buf.append(lp_ep)
+        adv_buf.append(adv_ep)
+        ret_buf.append(ret_ep)
+
+    if len(obs_buf) == 0:
+        raise RuntimeError("rollout_joint_levelB: collected 0 episodes")
+
+    obs = torch.cat(obs_buf).to(gcfg.device)
+    m   = torch.cat(m_buf).to(gcfg.device)
+    s   = torch.cat(s_buf).to(gcfg.device)
+    logp= torch.cat(logp_buf).to(gcfg.device)
+    adv = torch.cat(adv_buf).to(gcfg.device)
+    ret = torch.cat(ret_buf).to(gcfg.device)
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+    return dict(
+        obs=obs, m=m, s=s, logp=logp, adv=adv, ret=ret,
+        rew_ep_mean=float(np.mean(rew_ep)), rew_ep_std=float(np.std(rew_ep))
+    )
+
+
+@torch.no_grad()
+def rollout_eval_levelB(
+    policy: JointBandPolicy,
+    cfg: PPOConfig,
+    *,
+    gcfg: globalsetting,
+    lam_choices: List[float],
+    target_choices: Optional[List[float]] = None,
+    batch_episodes: int = 16,
+    R: np.ndarray,
+    mv_allow_cash: bool = True,
+    mv_round_nd: int = 4,
+    mv_solver: str = "OSQP",
+    qp_solver: str = "OSQP",
+    topk: int | None = None,
+) -> Dict[str, float]:
+    """
+    Evaluate A2-trained policy under Level-B executor (rotated-box projection + sell/buy).
+    """
+    if R is None:
+        raise ValueError("rollout_eval_levelB: R must be provided")
+
+    N = gcfg.N_ASSETS
+    rew_ep = []
+    lret_ep = []
+
+    for _ in range(batch_episodes):
+        beta = np.random.uniform(-0.95, 0.95, size=N)
+        lam = float(np.random.choice(lam_choices))
+        target_ann = (float(np.random.choice(target_choices)) if (target_choices is not None and len(target_choices) > 0)
+                      else float(getattr(gcfg, "TARGET_RET_ANN", 0.06)))
+        target_ann = max(target_ann, 0.0)
+
+        env = make_env(gcfg, R)
+        obs = env.reset(beta=beta, lam=lam, target_ret=target_ann, w0=None)
+        target_ann_eff = float(env.target_ret_ann)
+
+        m_star = mv_center_qp(env.Cov, gcfg.sigmas, beta, target_ann_eff,
+                              allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
+
+        ep_rew = 0.0
+        ep_lret = 0.0
+
+        # rotated-basis width prior
+        U, delta_z = compute_delta_rotated(
+            m_star=m_star,
+            Cov=env.Cov,
+            gamma=float(getattr(gcfg, "RISK_GAMMA", 1.0)),
+            lam=lam,
+            scale=1.0,
+        )
+
+        for t in range(env.T):
+            o = torch.tensor(obs, dtype=torch.float32, device=gcfg.device).unsqueeze(0)
+            # width scale from trained policy (stage2 head_s)
+            s_t, _, _ = policy.sample_s_only(o)
+            s_np = s_t.squeeze(0).detach().cpu().numpy()
+
+            s_eff = apply_topk_s(s_np, topk=topk)
+            b_z = 0.95 * s_eff * delta_z
+
+            obs, r, done, lret = env.step_rotated_box(
+                m=m_star,
+                U=U,
+                b_z=b_z,
+                allow_cash=mv_allow_cash,
+                solver=qp_solver,
+                use_trade_penalty=True,
+            )
+            ep_rew += float(r)
+            ep_lret += float(lret)
+            if done:
+                break
+
+        rew_ep.append(ep_rew)
+        lret_ep.append(ep_lret)
+
+    return dict(
+        rew_ep_mean=float(np.mean(rew_ep)),
+        rew_ep_std=float(np.std(rew_ep)),
+        lret_ep_mean=float(np.mean(lret_ep)),
+        lret_ep_std=float(np.std(lret_ep)),
+    )

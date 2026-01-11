@@ -3,6 +3,7 @@ import math
 import torch
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
+import cvxpy as cp
 
 from RLopt_helpers import clamp01_vec
 
@@ -119,6 +120,123 @@ def reflect_multi(S: np.ndarray,
     #w_after = S / (S.sum() + C + 1e-30)
     #print("max A-gap", np.max(A - w_after), "max B-viol", np.max(w_after - B), "cash", C)
     return S, C, sold_total
+
+def project_rotated_box_qp(
+    w: np.ndarray,
+    m: np.ndarray,
+    U: np.ndarray,
+    b_z: np.ndarray,
+    *,
+    allow_cash: bool = True,
+    solver: str = "OSQP",
+) -> np.ndarray:
+    """
+    Projection of w onto rotated box:
+        |U^T (u - m)| <= b_z, u>=0, sum(u)<=1 (cash) or ==1 (no cash)
+    """
+    w = np.asarray(w, float).reshape(-1)
+    m = np.asarray(m, float).reshape(-1)
+    U = np.asarray(U, float)
+    b_z = np.asarray(b_z, float).reshape(-1)
+    n = w.size
+
+    u = cp.Variable(n)
+    z = U.T @ (u - m)
+
+    obj = cp.Minimize(0.5 * cp.sum_squares(u - w))
+    cons = [u >= 0, z <= b_z, z >= -b_z]
+    cons += [cp.sum(u) <= 1.0] if allow_cash else [cp.sum(u) == 1.0]
+
+    prob = cp.Problem(obj, cons)
+    try:
+        prob.solve(
+            solver=cp.OSQP,
+            verbose=False,
+            warm_start=True,
+            eps_abs=1e-7,
+            eps_rel=1e-7,
+            max_iter=200000,
+            polish=True,
+        )
+        #prob.solve(solver=getattr(cp, solver), verbose=False, warm_start=True)
+    except Exception:
+        prob.solve(solver=cp.SCS, verbose=False)
+
+    if u.value is None:
+        # fallback: do nothing
+        return w.copy()
+
+    out = np.array(u.value, dtype=float).reshape(-1)
+    out = clamp01_vec(out)
+    # optional: enforce sum constraint softly (avoid numerical glitches)
+    s = float(out.sum())
+    if allow_cash:
+        if s > 1.0 + 1e-10:
+            out /= max(s, 1e-12)
+    else:
+        if s > 1e-12:
+            out /= s
+    return out
+
+def trade_to_target_sellonly(
+    S: np.ndarray,
+    C: float,
+    w_target: np.ndarray,
+    lam: np.ndarray | float,
+) -> Tuple[np.ndarray, float, float]:
+    """
+    Execute trades to move from current weights to target weights (approximately),
+    with sell-only proportional wedge via lam in (0,1].
+
+    Strategy:
+      1) Sell assets where current dollar > target dollar (pay wedge on proceeds)
+      2) Use remaining cash to buy assets where current dollar < target dollar (free buy, cash-limited)
+
+    Returns (S_new, C_new, sold_total_gross)
+    """
+    S = np.asarray(S, float).copy()
+    N = S.size
+    lam_vec = lam if isinstance(lam, np.ndarray) else np.full(N, float(lam), dtype=float)
+    w_target = np.asarray(w_target, float).reshape(-1)
+
+    Y = float(S.sum() + C)
+    if Y <= 0:
+        return S, float(C), 0.0
+
+    # --- SELL step ---
+    sold_total = 0.0
+    x = S.copy()                    # dollars in risky
+    x_t = np.maximum(0.0, w_target) * Y  # target dollars (based on pre-trade wealth)
+
+    sell_amt = np.maximum(0.0, x - x_t)  # gross sell dollars
+    sell_idx = np.where(sell_amt > 1e-12)[0]
+    for i in sell_idx:
+        d = min(float(sell_amt[i]), float(S[i]))
+        S[i] -= d
+        C    += float(lam_vec[i]) * d
+        sold_total += d
+
+    # update wealth after sells
+    Y = float(S.sum() + C)
+    if Y <= 0:
+        return S, float(max(0.0, C)), sold_total
+
+    # --- BUY step (free, cash-limited) ---
+    x = S.copy()
+    # recompute target dollars w.r.t updated wealth
+    x_t = np.maximum(0.0, w_target) * Y
+    buy_need = np.maximum(0.0, x_t - x)
+    total_need = float(buy_need.sum())
+    if total_need <= 1e-12 or C <= 1e-12:
+        return S, float(C), sold_total
+
+    spend = min(float(C), total_need)
+    buy_amt = buy_need / (total_need + 1e-30) * spend
+    S += buy_amt
+    C -= float(buy_amt.sum())
+
+    return S, float(C), sold_total
+
 
 # ----------------------------
 # Environment (Multi-asset)
@@ -292,3 +410,160 @@ class GBMBandEnvMulti:
 
         obs = self._make_obs()
         return obs, float(r_step), done, float(lret)
+    
+    def step_rotated_box(
+        self,
+        m: np.ndarray,
+        U: np.ndarray,
+        b_z: np.ndarray,
+        *,
+        allow_cash: bool = True,
+        solver: str = "OSQP",
+        use_trade_penalty: bool = True,
+        ):
+        """
+        Level B evaluation step with inside-band no-trade shortcut
+        """
+
+        m = np.asarray(m, float).reshape(-1)
+        b_z = np.asarray(b_z, float).reshape(-1)
+        U = np.asarray(U, float)
+        N = self.cfg.N_ASSETS
+        assert m.size == N and b_z.size == N and U.shape == (N, N)
+
+        Y_prev = self.S.sum() + self.C
+        w = self.S / (Y_prev + 1e-30)
+
+        # ======================================================
+        # (A) inside-band check in rotated coordinates
+        # ======================================================
+        z = U.T @ (w - m)
+        inside = np.all(np.abs(z) <= b_z + 1e-12)
+
+        sold_total = 0.0
+
+        if not inside:
+            # ==================================================
+            # (B) OUTSIDE band: QP + sell-only trades
+            # ==================================================
+            w_proj = project_rotated_box_qp(
+                w, m, U, b_z,
+                allow_cash=allow_cash,
+                solver=solver
+            )
+            self.S, self.C, sold_total = trade_to_target_sellonly(
+                self.S, self.C, w_proj, self.lam
+            )
+        # else:
+        #   INSIDE band → no trade, keep S,C as is
+
+        # ======================================================
+        # (C) GBM evolution (same as before)
+        # ======================================================
+        z_eps = self._draw_z()
+        mu = self.r + (self.sigmas**2) * self.beta
+        mu_eff = mu - self.r if self.discount_by_bank else mu
+        growth = np.exp(
+            (mu_eff - 0.5*self.sigmas**2)*self.dt
+            + self.sigmas*np.sqrt(self.dt)*z_eps
+        )
+        self.S *= growth
+        self.C *= self.bank_growth
+        self.t += 1
+        done = (self.t >= self.T)
+        Y_next = self.S.sum() + self.C
+
+        # ======================================================
+        # (D) trade penalty (only if traded)
+        # ======================================================
+        trade_pen = 0.0
+        if use_trade_penalty and (sold_total > 0.0):
+            lam_scalar = float(self.lam.mean()) if isinstance(self.lam, np.ndarray) else float(self.lam)
+            trade_pen = (
+                self.cfg.TRADE_PEN_COEF
+                * (1.0 - lam_scalar)
+                * float(sold_total / max(Y_prev, 1e-30))
+            )
+
+        # ======================================================
+        # (E) reward (unchanged)
+        # ======================================================
+        r_simple = (Y_next / max(Y_prev, 1e-30)) - 1.0
+
+        Y_mid = self.S.sum() + self.C
+        w_mid = self.S / (Y_mid + 1e-30)
+
+        mu_w_dt  = float(mu_eff @ w_mid) * self.dt
+        var_w_dt = float(w_mid @ self.Cov @ w_mid) * self.dt
+
+        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 1.0))
+        eta_target = float(getattr(self.cfg, "TARGET_ETA", 0.0))
+        shortfall = max(0.0, float(self.target_ret_dt) - mu_w_dt)
+
+        u_mv = r_simple - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
+        r_step = u_mv - trade_pen
+
+        obs = self._make_obs()
+        return obs, float(r_step), done, float(r_simple)
+
+    def step_rotated_box_old(
+            self,
+            m: np.ndarray,
+            U: np.ndarray,
+            b_z: np.ndarray,
+            *,
+            allow_cash: bool = True,
+            solver: str = "OSQP",
+            use_trade_penalty: bool = True,
+            ):
+        """
+        Level B evaluation step:
+        - Project current w onto rotated box |U^T(w-m)|<=b_z with simplex constraints
+        - Execute sell-only trades towards the projected target
+        - Then run GBM dynamics and compute reward using existing logic
+        """
+        Y_prev = self.S.sum() + self.C
+        w = self.S / (Y_prev + 1e-30)
+
+        w_proj = project_rotated_box_qp(w, m, U, b_z, allow_cash=allow_cash, solver=solver)
+        self.S, self.C, sold_total = trade_to_target_sellonly(self.S, self.C, w_proj, self.lam)
+
+        # ---- GBM evolution (same as step) ----
+        z = self._draw_z()
+        mu = self.r + (self.sigmas**2) * self.beta
+        mu_eff = mu - self.r if self.discount_by_bank else mu
+        growth = np.exp((mu_eff - 0.5*self.sigmas**2)*self.dt + self.sigmas*np.sqrt(self.dt)*z)
+        self.S *= growth
+        self.C *= self.bank_growth
+        self.t += 1
+        done = (self.t >= self.T)
+        Y_next = self.S.sum() + self.C
+
+        # trade penalty (same rule)
+        trade_pen = 0.0
+        if use_trade_penalty:
+            lam_scalar = float(self.lam.mean()) if isinstance(self.lam, np.ndarray) else float(self.lam)
+            trade_pen = self.cfg.TRADE_PEN_COEF * (1.0 - lam_scalar) * float(sold_total / max(Y_prev, 1e-30))
+
+        # diagnostic return
+        r_simple = (Y_next / max(Y_prev, 1e-30)) - 1.0
+
+        # MV/LQ shaping (same)
+        Y_mid = self.S.sum() + self.C
+        w_mid = self.S / (Y_mid + 1e-30)
+
+        mu = self.r + (self.sigmas**2) * self.beta
+        mu_eff = mu - self.r if self.discount_by_bank else mu
+
+        mu_w_dt  = float(mu_eff @ w_mid) * self.dt
+        var_w_dt = float(w_mid @ self.Cov @ w_mid) * self.dt
+
+        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 1.0))
+        eta_target = float(getattr(self.cfg, "TARGET_ETA", 0.0))
+        shortfall = max(0.0, float(self.target_ret_dt) - mu_w_dt)
+
+        u_mv = r_simple - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
+        r_step = u_mv - trade_pen
+
+        obs = self._make_obs()
+        return obs, float(r_step), done, float(r_simple)
