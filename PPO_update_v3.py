@@ -5,7 +5,7 @@ from GBMEnv_LQ_v4 import globalsetting
 from PPO_agent_v3 import JointBandPolicy, ValueNetCLS, PPOConfig, GLOBAL_DIM
 
 def ppo_update_joint(policy: JointBandPolicy, valuef: ValueNetCLS, opt_pi, opt_v, cfg: PPOConfig, batch,
-                     env_cfg: globalsetting,stage:int=2, width_prior_w:float=0.02):
+                     env_cfg: globalsetting,stage:int=2, width_prior_w:float=0):
     obs = batch['obs']; m_pre = batch['m']; s_pre = batch['s']; logp_old = batch['logp']
     adv = batch['adv']; ret = batch['ret']
     N = obs.shape[0]; n_assets = m_pre.shape[1]
