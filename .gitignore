@@ -1,0 +1,12 @@
+# python
+__pycache__/
+*.pyc
+
+# data / outputs
+asset_data/*.pkl
+runs/
+outputs/
+
+# env
+.env
+.ipynb_checkpoints/
