@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 import argparse
+import time
 from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
@@ -155,22 +157,93 @@ def maybe_load_regimes(regime_json_path: Optional[str]) -> Tuple[Optional[List[D
      if P is None or P.ndim != 2:
          raise ValueError("regime_json must contain 2D 'P'")
      return regimes, P
- 
-def make_regime_env_ctor(regimes: List[Dict[str, Any]], P: np.ndarray, gcfg: globalsetting):
-    """
-    rollout_joint_levelB に渡す env_ctor を作る。
-    R は env 内で regime ごとに切り替わるので rollout 側からはダミーでOK。
-    """
-    # R は必須引数なので regime[0] の R を使う（なければ I）
-    R0 = regimes[0].get("R", None)
-    if R0 is None:
-        n = len(regimes[0]["sigmas"])
-        R0 = np.eye(n)
-    else:
-         R0 = np.asarray(R0, float)
+
+def _ensure_regime_arrays(regimes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize regimes dict entries to numpy arrays for beta/sigmas/R."""
+    out = []
+    for r in regimes:
+        rr = dict(r)
+        rr["beta"] = np.asarray(rr["beta"], float).reshape(-1)
+        rr["sigmas"] = np.asarray(rr["sigmas"], float).reshape(-1)
+        if "R" in rr and rr["R"] is not None:
+            rr["R"] = np.asarray(rr["R"], float)
+        out.append(rr)
+    return out
+
+def make_regime_env_ctor(
+    regimes: List[Dict[str, Any]],
+    P: np.ndarray,
+    gcfg: globalsetting,
+    *,
+    market_sampler=None,
+    base_seed: int = 1234,
+    ):
+    regimes0 = _ensure_regime_arrays(regimes)
+    P = np.asarray(P, float)
+    N = int(gcfg.N_ASSETS)
+
+    # fallback R
+    R_fallback = regimes0[0].get("R", None)
+    if R_fallback is None:
+        R_fallback = np.eye(N, dtype=float)
+
+    # internal counter -> episode-wise randomness (each env instantiation)
+    counter = {"k": 0}
+
+    # base sigmas (for scaling multipliers if sampler returns absolute sigmas)
+    base_sigmas_env = np.asarray(getattr(gcfg, "sigmas", np.ones(N)), float).reshape(-1)
+    base_sigmas_env = np.where(base_sigmas_env <= 0, 1.0, base_sigmas_env)
+
     def _ctor():
-         return RegimeGBMBandEnvMulti(cfg=gcfg, regimes=regimes, P=P, R=R0)
+        kk = int(counter["k"])
+        counter["k"] += 1
+
+        # --- optionally randomize market per-episode ---
+        if market_sampler is not None:
+            rng = np.random.default_rng(int(base_seed) + kk)
+            R_new, sig_new = market_sampler(rng, kk)  # sig_new is "env-scale" sigmas
+            R_new = np.asarray(R_new, float)
+            sig_new = np.asarray(sig_new, float).reshape(-1)
+            # multiplier relative to gcfg.sigmas (or 1)
+            mult = sig_new / base_sigmas_env
+        else:
+            R_new, mult = R_fallback, np.ones(N, dtype=float)
+
+        # --- build randomized regimes for this episode ---
+        regimes_ep = []
+        for r in regimes0:
+            rr = dict(r)
+            rr["beta"] = np.asarray(rr["beta"], float).reshape(-1)
+            rr["sigmas"] = (np.asarray(rr["sigmas"], float).reshape(-1) * mult)
+            rr["R"] = R_new
+            regimes_ep.append(rr)
+
+        return RegimeGBMBandEnvMulti(cfg=gcfg, regimes=regimes_ep, P=P, R=R_new)
+
     return _ctor
+
+def save_checkpoint(
+    ckpt_dir: str,
+    *,
+    policy: JointBandPolicy,
+    valuef: ValueNetCLS,
+    opt_pi: torch.optim.Optimizer,
+    opt_v: torch.optim.Optimizer,
+    meta: Dict[str, Any],
+    epoch: int,
+):
+    p = Path(ckpt_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "epoch": int(epoch),
+        "policy": policy.state_dict(),
+        "value": valuef.state_dict(),
+        "opt_pi": opt_pi.state_dict(),
+        "opt_v": opt_v.state_dict(),
+        "meta": meta,
+        "ts": time.time(),
+    }
+    torch.save(payload, p / f"ft_epoch{epoch:03d}.pt")
 
 def mv_weights_target_return(
     Cov, mu_eff, target_ann,
@@ -369,6 +442,8 @@ def finetune_stage2_levelB(
     market_sampler=None,
     base_seed: int = 1234,
     env_ctor=None,
+    ckpt_dir: str | None = None,
+    save_every: int = 1,
 ):
     device = gcfg.device
     policy.to(device); valuef.to(device)
@@ -553,6 +628,11 @@ def finetune_stage2_levelB(
             f"| B-eval fixed={evalk_fixed} | randomized={evalk_rand}"
         )
 
+        # ---- checkpoint ----
+        if ckpt_dir is not None and save_every > 0 and (k % int(save_every) == 0):
+            meta = {"base_seed": int(base_seed), "domain_randomize": bool(domain_randomize)}
+            save_checkpoint(ckpt_dir, policy=policy, valuef=valuef, opt_pi=opt_pi, opt_v=opt_v, meta=meta, epoch=k)
+
     return policy, valuef
 
 if __name__ == "__main__":
@@ -565,6 +645,9 @@ if __name__ == "__main__":
     ap.add_argument("--value_in",  type=str, default="value_stage2_A2.pt")
     ap.add_argument("--policy_out", type=str, default="policy_stage2_B2_2_finetuned.pt")
     ap.add_argument("--value_out",  type=str, default="value_stage2_B2_2_finetuned.pt")
+    ap.add_argument("--corr_randomize", action="store_true", help="randomize correlation/sigmas per episode during finetune (also in regime mode)")
+    ap.add_argument("--ckpt_dir", type=str, default="checkpoints_regime_B2/finetune_runs")
+    ap.add_argument("--save_every", type=int, default=1)
     args = ap.parse_args()
 
     regimes, P = maybe_load_regimes(args.regime_json)
@@ -572,9 +655,13 @@ if __name__ == "__main__":
         # non-regime: Corr matrix (same as your training setup)
         R = build_corr_from_pairs(gcfg.N_ASSETS, base_rho=0.20, pair_rhos=gcfg.pair_rhos, make_psd=True)
         env_ctor = None
+        market_sampler = make_market_sampler(gcfg)  # non-regime uses rollout-side sampler
     else:
         # regime: env_ctor injects RegimeGBMBandEnvMulti
-        env_ctor = make_regime_env_ctor(regimes, P, gcfg)
+        # randomize inside env_ctor (episode-wise)
+        market_sampler = make_market_sampler(gcfg) if args.corr_randomize else None
+        env_ctor = make_regime_env_ctor(regimes, P, gcfg, market_sampler=market_sampler, base_seed=1234)
+
         # Rollout 側の API 的に R が必要な箇所があるのでダミーを渡す
         R = np.eye(gcfg.N_ASSETS, dtype=float)
 
@@ -602,9 +689,10 @@ if __name__ == "__main__":
         qp_solver="OSQP",
         topk = 2,
         env_ctor=env_ctor,
-        # regime env では market_sampler による相関/σランダム化はまず切って動作確認
-        domain_randomize=False if env_ctor is not None else True,
-        market_sampler=None,
+        domain_randomize=True,
+        market_sampler=(market_sampler if env_ctor is None else None),
+        ckpt_dir=args.ckpt_dir,
+        save_every=args.save_every,
     )
 
     # fine-tuned weights save
