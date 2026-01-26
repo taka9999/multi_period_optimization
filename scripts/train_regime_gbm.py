@@ -1,6 +1,7 @@
 # train_regime_gbm.py
 import os, json, random
 import copy
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -24,6 +25,36 @@ def set_seed(seed: int, device):
     torch.manual_seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
+
+def load_regime_json(path: str, *, N: int):
+    """
+    Load regimes/P from JSON like:
+      {"regimes":[{"beta":[...],"sigmas":[...],"R":[[...]]}, ...],
+       "P":[[...],[...]],
+       "dt": 0.003968... (optional)}
+    Returns: (regimes_list, P_array, dt_or_None)
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"regime json not found: {p}")
+    obj = json.loads(p.read_text())
+    regimes_in = obj["regimes"]
+    P = np.asarray(obj["P"], float)
+    dt = obj.get("dt", None)
+
+    regimes = []
+    for r in regimes_in:
+        beta = np.asarray(r["beta"], float).reshape(-1)
+        sigmas = np.asarray(r["sigmas"], float).reshape(-1)
+        R = np.asarray(r["R"], float)
+        if beta.size != N or sigmas.size != N:
+            raise ValueError(f"regime dim mismatch: beta={beta.size}, sigmas={sigmas.size}, expected N={N}")
+        if R.shape != (N, N):
+            raise ValueError(f"R shape mismatch: {R.shape}, expected {(N,N)}")
+        regimes.append(dict(beta=beta, sigmas=sigmas, R=R))
+    if P.shape[0] != P.shape[1] or P.shape[0] != len(regimes):
+        raise ValueError(f"P shape mismatch: {P.shape}, expected KxK with K={len(regimes)}")
+    return regimes, P, dt
 
 
 def main():
@@ -62,6 +93,7 @@ def main():
     _ = build_cov(sigmas=globalcfg.sigmas, R=R_base, make_psd=True)
 
     target_choices = [0.02, 0.04, 0.06, 0.08]
+    REGIME_JSON = os.environ.get("REGIME_JSON", "configs/regime_k2_hist.json")
 
     cfg = PPOConfig(
         horizon=globalcfg.T_days,
@@ -89,22 +121,27 @@ def main():
         extra_pairs = extra_pairs or {}
         return build_corr_from_pairs(N, base_rho=base_rho, pair_rhos=extra_pairs, make_psd=True)
 
-    regimes = [
-        dict(
-            beta=np.ones(N)*0.6,
-            sigmas=np.array([0.18, 0.15, 0.10, 0.12, 0.14]),
-            R=corr_from_base(0.25, {(0,1):0.55})
-        ),
-        dict(
-            beta=np.ones(N)*(-0.2),
-            sigmas=np.array([0.45, 0.35, 0.18, 0.28, 0.32]),
-            R=corr_from_base(0.60, {(1,3):-0.15})
-        )
+    # Default (fallback) regimes if JSON is missing
+    regimes_default = [
+        dict(beta=np.ones(N)*0.6,
+             sigmas=np.array([0.18, 0.15, 0.10, 0.12, 0.14]),
+             R=corr_from_base(0.25, {(0,1):0.55})),
+        dict(beta=np.ones(N)*(-0.2),
+             sigmas=np.array([0.45, 0.35, 0.18, 0.28, 0.32]),
+             R=corr_from_base(0.60, {(1,3):-0.15})),
     ]
-    P = np.array([
-        [0.97, 0.03],
-        [0.10, 0.90]
-    ], float)
+    P_default = np.array([[0.97, 0.03],
+                          [0.10, 0.90]], float)
+
+    try:
+        regimes, P, dt_json = load_regime_json(REGIME_JSON, N=N)
+        print(f"[Regime] loaded from {REGIME_JSON} (K={len(regimes)})")
+        if dt_json is not None and hasattr(globalcfg, "dt"):
+            globalcfg.dt = float(dt_json)
+            print(f"[Regime] set globalcfg.dt={globalcfg.dt} from JSON")
+    except Exception as e:
+        regimes, P = regimes_default, P_default
+        print(f"[Regime] fallback to default regimes because: {e}")
 
     # env factory to inject into rollout
     #def env_ctor():

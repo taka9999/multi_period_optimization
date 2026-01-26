@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
+from pathlib import Path
+import argparse
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -216,6 +220,8 @@ def estimate_2regime_gaussian_hmm(
     returns_df: pd.DataFrame,
     *,
     cols: List[str],
+    rf_col: str | None = None,
+    subtract_rf: bool = True,
     train_start: str | None = None,
     train_end: str | None = None,
     use_hmmlearn_if_available: bool = True,
@@ -261,8 +267,23 @@ def estimate_2regime_gaussian_hmm(
     missing = [c for c in cols if c not in df.columns]
     if missing:
         raise KeyError(f"Missing columns in returns_df: {missing}")
-    X = df[cols].dropna().to_numpy(dtype=float)
-    idx = df[cols].dropna().index
+    # --- build observation matrix ---
+    # We assume asset returns are daily log-returns.
+    # For portfolio optimization / GBM env alignment, it is usually better to estimate on EXCESS log-returns:
+    #   x_t = logret(asset) - logret(TBill)
+    # so that "r" is not baked into regime means.
+    work = df[cols].copy()
+    if subtract_rf and (rf_col is not None):
+        if rf_col not in df.columns:
+            raise KeyError(f"rf_col={rf_col} not found in returns_df columns")
+        # align & subtract risk-free (broadcast)
+        rf = df[rf_col].reindex(work.index)
+        work = work.sub(rf, axis=0)
+
+    work = work.dropna()
+    X = work.to_numpy(dtype=float)
+    idx = work.index
+
     if X.shape[0] < 200:
         raise ValueError(f"Too few observations after slicing/dropna: T={X.shape[0]}")
 
@@ -304,18 +325,18 @@ def estimate_2regime_gaussian_hmm(
     gamma = fitted.gamma
     w_bar = gamma.mean(axis=0)  # average occupancy as a weight proxy
     for k in range(K):
-        mu = fitted.mus[k].reshape(-1)
+        mu_log = fitted.mus[k].reshape(-1)  # daily mean of (possibly excess) log-returns
         Sigma = _ensure_psd(fitted.Sigmas[k])
         sig2 = np.clip(np.diag(Sigma), 1e-12, None)
         sigmas = np.sqrt(sig2)
-        beta = mu / sig2
+        beta = (mu_log + 0.5 * sig2) / sig2
         R = _corr_from_cov(Sigma)
         regimes.append(
             dict(
                 beta=beta,
                 sigmas=sigmas,
                 R=R,
-                mu=mu,
+                mu_log=mu_log,
                 Sigma=Sigma,
                 weight=float(w_bar[k]),
             )
@@ -338,32 +359,102 @@ def estimate_2regime_gaussian_hmm(
 
     return regimes, fitted.P, state_series, info
 
+def _jsonify_regimes_for_env(
+    regimes: List[Dict],
+    P: np.ndarray,
+    *,
+    dt: float,
+    annualize_for_env: bool = True,
+) -> Dict:
+    """
+    Convert regimes/P into a JSON-serializable dict for configs/regime_k2.json.
+
+    If env uses GBM form:
+      exp((mu_eff - 0.5*sigma^2)*dt + sigma*sqrt(dt)*z),
+    and dt is in "years per step" (e.g., 1/252), it is convenient to store sigma as ANNUAL.
+
+    HMM here estimates daily moments (per step). If dt=1/252 and annualize_for_env=True:
+      sigma_annual = sigma_step / sqrt(dt)
+    Correlation is invariant to scaling.
+    """
+    out_regimes = []
+    for r in regimes:
+        sig_step = np.asarray(r["sigmas"], float)
+        if annualize_for_env:
+            sig_out = (sig_step / np.sqrt(dt)).tolist()
+        else:
+            sig_out = sig_step.tolist()
+        out_regimes.append(
+            dict(
+                beta=np.asarray(r["beta"], float).tolist(),
+                sigmas=sig_out,
+                R=np.asarray(r["R"], float).tolist(),
+            )
+        )
+    return {"regimes": out_regimes, "P": np.asarray(P, float).tolist(), "dt": float(dt)}
+
+
 
 # -----------------------------
 # Example usage (your defaults)
 # -----------------------------
 if __name__ == "__main__":
-    PREFER_COLS = ["LargeCap", "MidCap", "SmallCap", "EAFE", "EM"]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train-start", type=str, default="1991-01-01")
+    parser.add_argument("--train-end", type=str, default="2018-12-31")
+    parser.add_argument("--cols", type=str, default="LargeCap,MidCap,SmallCap,EAFE,EM",
+                        help="comma-separated asset columns")
+    parser.add_argument("--rf-col", type=str, default="TBill")
+    parser.add_argument("--no-subtract-rf", action="store_true")
+    parser.add_argument("--dt", type=float, default=1/252, help="years per step used in env (e.g., 1/252)")
+    parser.add_argument("--no-annualize-sigma", action="store_true",
+                        help="if set, writes per-step sigma to JSON instead of annualized sigma")
+    parser.add_argument("--out", type=str, default="configs/regime_k2.json")
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--n-iter", type=int, default=300)
+    parser.add_argument("--tol", type=float, default=1e-5)
+    parser.add_argument("--cov-reg", type=float, default=1e-6)
+    args = parser.parse_args()
 
-    # 例: asset_returns.pkl が「列=資産、index=date」の DataFrame だと仮定
-    df = pd.read_pickle("/data/asset_returns.pkl")
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    DATA_PATH = PROJECT_ROOT / "asset_data" / "asset_returns.pkl"
+    df = pd.read_pickle(DATA_PATH)
 
+    cols = [c.strip() for c in args.cols.split(",") if c.strip()]
     regimes, P, st, info = estimate_2regime_gaussian_hmm(
         df,
-        cols=PREFER_COLS,
-        train_start="2007-01-01",
-        train_end="2018-12-31",
-        seed=123,
-        n_iter=300,
-        tol=1e-5,
-        cov_reg=1e-6,
+        cols=cols,
+        rf_col=args.rf_col,
+        subtract_rf=(not args.no_subtract_rf),
+        train_start=args.train_start,
+        train_end=args.train_end,
+        seed=args.seed,
+        n_iter=args.n_iter,
+        tol=args.tol,
+        cov_reg=args.cov_reg,
     )
 
     print("used:", info["used"])
     print("loglik:", info["loglik"], "n_iter:", info["n_iter"])
     print("P:\n", P)
+
+    # Pretty print with BOTH daily and annualized sigma for sanity
+    dt = float(args.dt)
     for k, r in enumerate(regimes):
+        sig_step = np.asarray(r["sigmas"], float)
+        sig_ann = sig_step / np.sqrt(dt)
         print(f"\n--- regime {k} weight~{r['weight']:.3f} ---")
         print("beta:", np.round(r["beta"], 3))
-        print("sigmas:", np.round(r["sigmas"], 3))
+        print("sigmas_step:", np.round(sig_step, 4), " | sigmas_ann:", np.round(sig_ann, 3))
         print("R[0:3,0:3]:\n", np.round(r["R"][:3, :3], 3))
+
+    # Write JSON for training
+    out_path = PROJECT_ROOT / args.out
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _jsonify_regimes_for_env(
+        regimes, P,
+        dt=dt,
+        annualize_for_env=(not args.no_annualize_sigma),
+    )
+    out_path.write_text(json.dumps(payload, indent=2))
+    print(f"\n[Wrote] {out_path}")
