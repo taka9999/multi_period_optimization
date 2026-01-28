@@ -81,8 +81,8 @@ def main():
     # --- episode-level regime randomization ---
     # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.
     globalcfg.REGIME_EPISODE_RANDOMIZE = True
-    globalcfg.REGIME_BETA_STD = 0.05        # std for beta perturbation
-    globalcfg.REGIME_SIGMA_LOGSTD = 0.10    # log-std for sigma multiplicative noise
+    globalcfg.REGIME_BETA_STD = 0.15        # std for beta perturbation
+    globalcfg.REGIME_SIGMA_LOGSTD = 0.3    # log-std for sigma multiplicative noise
     globalcfg.REGIME_CORR_NOISE = 0.02      # additive noise on correlation matrix entries
     globalcfg.REGIME_BETA_CLIP = 0.999
     globalcfg.REGIME_SIGMA_CLIP = (1e-4, 10.0)

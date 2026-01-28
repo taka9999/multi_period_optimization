@@ -23,7 +23,12 @@ Assumptions:
 from __future__ import annotations
 
 import os
+import json
+import argparse
+from pathlib import Path
+from datetime import datetime
 
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -104,7 +109,37 @@ def load_historical_log_returns(pkl_path: str, N: int, prefer_cols: list[str] | 
     Rlog = df_sel.to_numpy(dtype=float)
     return df_sel, Rlog, cols
 
+def apply_eval_date_range(df_sel: pd.DataFrame, eval_start: str | None, eval_end: str | None) -> pd.DataFrame:
+    """
+    Robust slice by date range.
+    - Forces index to DatetimeIndex (handles datetime.date index)
+    - Allows eval_start/end to be non-trading days (uses searchsorted)
+    """
+    if df_sel is None or len(df_sel) == 0:
+        return df_sel
 
+    out = df_sel.copy()
+
+    # 1) normalize index -> DatetimeIndex, sorted
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index)
+    out = out.sort_index()
+
+    if eval_start is None and eval_end is None:
+        return out
+
+    # 2) searchsorted slice so missing dates are OK
+    i0 = 0
+    i1 = len(out)
+    if eval_start is not None:
+        ts0 = pd.Timestamp(eval_start)
+        i0 = int(out.index.searchsorted(ts0, side="left"))
+    if eval_end is not None:
+        ts1 = pd.Timestamp(eval_end)
+        i1 = int(out.index.searchsorted(ts1, side="right"))
+
+    out = out.iloc[i0:i1]
+    return out
 # ============================================================
 # 2) Annualization + Sharpe
 # ============================================================
@@ -126,6 +161,17 @@ def ann_geom_mean_vol_from_rsimple(rsimple, dt=1 / 252):
 def sharpe_from_ann(ann_mean, ann_vol, rf_ann=0.0):
     return (float(ann_mean) - float(rf_ann)) / (float(ann_vol) + 1e-12)
 
+def wealth_from_rsimple(rsimple, w0=100.0):
+    rs = np.asarray(rsimple, float).reshape(-1)
+    W = np.empty(rs.size + 1, float)
+    W[0] = float(w0)
+    for t in range(rs.size):
+        W[t + 1] = W[t] * (1.0 + rs[t])
+    return W
+
+def safe_log_wealth(W, eps=1e-12):
+    W = np.asarray(W, float)
+    return np.log(np.maximum(eps, W))
 
 # ============================================================
 # 3) MV QP solver
@@ -603,6 +649,116 @@ def eval_frontier_historical(
     info = {"skipped": skipped}
     return res_arith, res_geom, res_sh_arith, res_sh_geom, raw, info
 
+def make_start_indices(T_total: int, T_days: int, n_windows: int, seed: int, start_idx_list=None):
+    max_start = int(T_total - T_days - 1)
+    if max_start <= 0:
+        raise ValueError(f"Not enough data for chosen T_days. T_total={T_total}, T_days={T_days}")
+    if start_idx_list is not None:
+        out = []
+        for s in start_idx_list:
+            s = int(s)
+            if s < 0 or s > max_start:
+                raise ValueError(f"start_idx {s} out of range [0, {max_start}]")
+            out.append(s)
+        return out[:n_windows]
+    rng = np.random.default_rng(int(seed))
+    return [int(rng.integers(0, max_start)) for _ in range(int(n_windows))]
+
+def plot_wealth_overlay_grid(
+    df_sel: pd.DataFrame,
+    returns_log: np.ndarray,
+    cfg,
+    *,
+    policy_A2,
+    policy_B2,
+    target_ann: float,
+    T_days: int,
+    lam_cost: float,
+    rebalance_every: int,
+    n_windows: int = 4,
+    seed: int = 2025,
+    start_idx_list=None,
+    log_scale: bool = True,
+    mv_solver: str = "OSQP",
+    qp_solver: str = "OSQP",
+    out_png: str | None = None,
+):
+    starts = make_start_indices(
+        T_total=returns_log.shape[0],
+        T_days=T_days,
+        n_windows=n_windows,
+        seed=seed,
+        start_idx_list=start_idx_list,
+    )
+    n = len(starts)
+    ncols = 1 if n == 1 else 2
+    nrows = int(math.ceil(n / ncols))
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(13, 4.7 * nrows), squeeze=False)
+    for k, start_idx in enumerate(starts):
+        r = k // ncols
+        c = k % ncols
+        ax = axes[r][c]
+
+        dates = df_sel.index[start_idx : start_idx + T_days + 1]
+
+        rs_mv_d = run_episode_MV_daily_frictionless_hist(
+            cfg, np.eye(cfg.N_ASSETS), returns_log, target_ann,
+            start_idx=start_idx, T_days=T_days, seed=int(seed) + k,
+            mv_solver=mv_solver, infeasible_policy="skip",
+        )
+        rs_mv_m = run_episode_MV_monthly_cost_hist(
+            cfg, np.eye(cfg.N_ASSETS), returns_log, lam_cost, target_ann,
+            start_idx=start_idx, T_days=T_days, rebalance_every=rebalance_every, seed=int(seed) + k,
+            mv_solver=mv_solver, infeasible_policy="skip",
+        )
+        rs_a2 = run_episode_RL_band_A2_hist(
+            cfg, np.eye(cfg.N_ASSETS), returns_log, policy_A2, lam_cost, target_ann,
+            start_idx=start_idx, T_days=T_days, seed=int(seed) + k, device=cfg.device,
+            mv_solver=mv_solver, infeasible_policy="skip",
+        )
+        rs_b2 = run_episode_RL_band_B2_hist(
+            cfg, np.eye(cfg.N_ASSETS), returns_log, policy_B2, lam_cost, target_ann,
+            start_idx=start_idx, T_days=T_days, seed=int(seed) + k, device=cfg.device,
+            mv_solver=mv_solver, qp_solver=qp_solver, infeasible_policy="skip",
+        )
+
+        curves = []
+        if rs_mv_d is not None: curves.append(("MV daily (frictionless)", rs_mv_d))
+        if rs_mv_m is not None: curves.append(("MV monthly (cost)", rs_mv_m))
+        if rs_a2 is not None:   curves.append(("RL A2 (band)", rs_a2))
+        if rs_b2 is not None:   curves.append(("RL B2 (rot-box)", rs_b2))
+
+        if not curves:
+            ax.set_title(f"start_idx={start_idx} (no feasible runs)")
+            ax.axis("off")
+            continue
+
+        for label, rs in curves:
+            W = wealth_from_rsimple(rs, 100.0)
+            y = safe_log_wealth(W) if log_scale else W
+            ax.plot(dates, y, label=label)
+
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Window {k+1}/{n} | start_idx={start_idx} | target={target_ann:.3f}")
+        ax.set_ylabel("log(wealth)" if log_scale else "wealth (base=100)")
+        ax.legend(fontsize=8)
+
+    # disable unused
+    for kk in range(n, nrows * ncols):
+        rr = kk // ncols
+        cc = kk % ncols
+        axes[rr][cc].axis("off")
+
+    fig.suptitle(
+        f"Wealth Overlay | target={target_ann:.3f} | {'LOG' if log_scale else 'LEVEL'} | n_windows={n}",
+        y=0.995,
+    )
+    plt.tight_layout()
+    if out_png is not None:
+        Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_png, dpi=160)
+    plt.show()
 
 # ============================================================
 # 6) Plotting
@@ -627,33 +783,104 @@ def plot_frontier(res, targets, title):
     plt.tight_layout()
     plt.show()
 
+def plot_frontier_save(res, targets, title, out_png: str):
+    strategies = [
+        ("MV_daily_frictionless", "o"),
+        ("MV_monthly_cost", "s"),
+        ("RL_band_A2", "^"),
+        ("RL_band_B2", "X"),
+    ]
+    plt.figure(figsize=(8, 6))
+    for s, mk in strategies:
+        xs = [res[s][t][1] for t in targets]  # vol
+        ys = [res[s][t][0] for t in targets]  # mean
+        plt.plot(xs, ys, marker=mk, linestyle="-", label=s)
+    plt.xlabel("Annualized Volatility")
+    plt.ylabel("Annualized Mean Excess Return")
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def summaries_to_frames(resA, resG, shA, shG, targets):
+    rowsA, rowsG = [], []
+    for s in resA.keys():
+        for t in targets:
+            m, v = resA[s][t]
+            rowsA.append(dict(strategy=s, target=float(t), mean=float(m), vol=float(v), sharpe=float(shA[s][t])))
+            m2, v2 = resG[s][t]
+            rowsG.append(dict(strategy=s, target=float(t), mean=float(m2), vol=float(v2), sharpe=float(shG[s][t])))
+    return pd.DataFrame(rowsA), pd.DataFrame(rowsG)
+
 
 # ============================================================
 # 7) MAIN
 # ============================================================
 if __name__ == "__main__":
-    # ----- user knobs -----
-    DATA_PKL = "asset_returns.pkl"  # change if needed
-    # If you want explicit mapping, set this list length==N_ASSETS
-    PREFER_COLS = ["LargeCap", "MidCap", "SmallCap", "EAFE", "EM"]
-    # Example:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=str, default="asset_data/asset_returns.pkl")
+    ap.add_argument("--cols", type=str, default="LargeCap,MidCap,SmallCap,EAFE,EM")
+    ap.add_argument("--policy_a2", type=str, default="checkpoints_regime_A2/policy_stage2_A2_regime.pt")
+    ap.add_argument("--policy_b2", type=str, default="checkpoints_regime_B2/policy_stage2_B2_finetuned.pt")
+    ap.add_argument("--targets", type=str, default="0.02:0.12:0.004")  # start:stop:step
+    ap.add_argument("--n_eps", type=int, default=30)
+    ap.add_argument("--T_days", type=int, default=252*5)
+    ap.add_argument("--lam", type=float, default=0.99)
+    ap.add_argument("--rebalance_every", type=int, default=21)
+    ap.add_argument("--out_dir", type=str, default="outputs/historical")
+    ap.add_argument("--run_name", type=str, default=None)
+    ap.add_argument("--eval_start", type=str, default=None, help="YYYY-MM-DD (slice data for evaluation)")
+    ap.add_argument("--eval_end", type=str, default=None, help="YYYY-MM-DD (slice data for evaluation)")
 
-    policy_path_A2 = "checkpoints_regime_A2/policy_stage2_A2_regime.pt"
-    policy_path_B2 = "checkpoints_regime_B2/policy_stage2_B2_2_finetuned.pt"
+    ap.add_argument("--plot_wealth", action="store_true", help="Also plot wealth overlay grids.")
+    ap.add_argument("--wealth_target", type=float, default=0.06)
+    ap.add_argument("--wealth_windows", type=int, default=4)
+    ap.add_argument("--wealth_log", action="store_true", help="Plot log(wealth) (recommended).")
 
+    ap.add_argument("--base_seed", type=int, default=2025)
+    ap.add_argument("--mv_solver", type=str, default="OSQP")
+    ap.add_argument("--qp_solver", type=str, default="OSQP")
+    ap.add_argument("--infeasible_policy", type=str, default="skip")
+    ap.add_argument("--no_show", action="store_true", help="Do not show plots (still saves png).")
+    args = ap.parse_args()
 
-    targets = np.arange(0.02, 0.12, 0.004)
-    #targets = [0.02, 0.04, 0.06, 0.08, 0.10]  # annual targets (excess), adjust
-    n_eps = 30
-    T_days = 252 * 5
-    lam_cost = 0.99
-    rebalance_every = 21
+    DATA_PKL = args.data
+    PREFER_COLS = [c.strip() for c in args.cols.split(",") if c.strip()]
+    policy_path_A2 = args.policy_a2
+    policy_path_B2 = args.policy_b2
+
+    # parse targets "a:b:step"
+    if ":" in args.targets:
+        a, b, st = args.targets.split(":")
+        targets = np.arange(float(a), float(b), float(st))
+    else:
+        targets = np.array([float(x) for x in args.targets.split(",") if x.strip()], float)
+    n_eps = int(args.n_eps)
+    T_days = int(args.T_days)
+    lam_cost = float(args.lam)
+    rebalance_every = int(args.rebalance_every)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = args.run_name or f"hist_{ts}_eps{n_eps}_T{T_days}_lam{lam_cost:.3f}"
+    out_root = Path(args.out_dir) / run_name
+    out_root.mkdir(parents=True, exist_ok=True)
 
     # ----- load returns -----
     N = int(globalcfg.N_ASSETS)
     df_sel, Rlog, cols = load_historical_log_returns(DATA_PKL, N, prefer_cols=PREFER_COLS)
+    # apply eval period slice (BEFORE dropna window sampling)
+    df_sel = apply_eval_date_range(df_sel, args.eval_start, args.eval_end)
+    df_sel = df_sel.dropna(axis=0, how="any")
+    Rlog = df_sel.to_numpy(dtype=float)
+
     print(f"[data] selected columns (N={N}): {cols}")
-    print(f"[data] usable rows after dropna: {len(df_sel)} (from {DATA_PKL})")
+    print(f"[data] usable rows after eval-slice+dropna: {len(df_sel)} (from {DATA_PKL})")
+    if args.eval_start or args.eval_end:
+        print(f"[data] eval range: start={args.eval_start} end={args.eval_end}")
+
     # Ensure contiguous windows possible
     if Rlog.shape[0] < T_days + 10:
         raise ValueError(f"Not enough history after dropna: T={Rlog.shape[0]} < T_days={T_days}")
@@ -678,11 +905,55 @@ if __name__ == "__main__":
         lam_cost=lam_cost,
         rebalance_every=rebalance_every,
         T_days=T_days,
-        base_seed=2025,
-        mv_solver="OSQP",
-        qp_solver="OSQP",
-        infeasible_policy="skip",
+        base_seed=int(args.base_seed),
+        mv_solver=str(args.mv_solver),
+        qp_solver=str(args.qp_solver),
+        infeasible_policy=str(args.infeasible_policy),
     )
+
+    dfA, dfG = summaries_to_frames(resA, resG, shA, shG, targets)
+    dfA.to_csv(out_root / "summary_arith.csv", index=False)
+    dfG.to_csv(out_root / "summary_geom.csv", index=False)
+    with open(out_root / "summary.json", "w") as f:
+        json.dump(
+            dict(
+                run_name=run_name,
+                data=str(DATA_PKL),
+                cols=cols,
+                targets=[float(t) for t in targets],
+                n_eps=n_eps,
+                T_days=T_days,
+                lam_cost=lam_cost,
+                rebalance_every=rebalance_every,
+                base_seed=int(args.base_seed),
+                mv_solver=str(args.mv_solver),
+                qp_solver=str(args.qp_solver),
+                infeasible_policy=str(args.infeasible_policy),
+                skipped=info.get("skipped", {}),
+            ),
+            f,
+            indent=2,
+        )
+    pd.to_pickle(raw, out_root / "raw.pkl")
+    plot_frontier_save(resA, targets, "Historical Frontier (Arithmetic)", str(out_root / "frontier_arith.png"))
+    plot_frontier_save(resG, targets, "Historical Frontier (Geometric / log1p)", str(out_root / "frontier_geom.png"))
+
+    # ----- optional wealth overlay -----
+    if args.plot_wealth:
+        out_png = str(out_root / "wealth_overlay.png")
+        plot_wealth_overlay_grid(
+            df_sel=df_sel, returns_log=Rlog, cfg=globalcfg,
+            policy_A2=policy_A2, policy_B2=policy_B2,
+            target_ann=float(args.wealth_target),
+            T_days=T_days, lam_cost=lam_cost, rebalance_every=rebalance_every,
+            n_windows=int(args.wealth_windows),
+            seed=int(args.base_seed) + 777,
+            log_scale=bool(args.wealth_log),
+            mv_solver=str(args.mv_solver), qp_solver=str(args.qp_solver),
+            out_png=out_png,
+        )
+
+    print(f"[Saved] {out_root}")
 
     # ----- print summary -----
     print("\n=== Arithmetic (mean, vol, Sharpe) ===")
@@ -700,5 +971,6 @@ if __name__ == "__main__":
             print(f"  target={t: .3f}  mean={m: .4f}  vol={v: .4f}  Sharpe={shG[s][t]: .3f}")
 
     # ----- plot -----
-    plot_frontier(resA, targets, "Historical Frontier (Arithmetic)")
-    plot_frontier(resG, targets, "Historical Frontier (Geometric / log1p)")
+    if not args.no_show:
+        plot_frontier(resA, targets, "Historical Frontier (Arithmetic)")
+        plot_frontier(resG, targets, "Historical Frontier (Geometric / log1p)")

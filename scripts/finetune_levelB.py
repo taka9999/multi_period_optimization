@@ -209,13 +209,29 @@ def make_regime_env_ctor(
         else:
             R_new, mult = R_fallback, np.ones(N, dtype=float)
 
-        # --- build randomized regimes for this episode ---
+        # --- build (possibly randomized) regimes for this episode ---
         regimes_ep = []
-        for r in regimes0:
+        for j, r in enumerate(regimes0):
             rr = dict(r)
             rr["beta"] = np.asarray(rr["beta"], float).reshape(-1)
             rr["sigmas"] = (np.asarray(rr["sigmas"], float).reshape(-1) * mult)
             rr["R"] = R_new
+            sig_base_reg = np.asarray(rr["sigmas"], float).reshape(-1)
+
+            if market_sampler is not None:
+                # regime-specific sampling (R_j, sig_j) per episode
+                # use different rng stream per regime for reproducibility
+                key = int(kk) * 1000 + int(j)
+                rng_j = np.random.default_rng(int(base_seed) + key)
+                Rj, sigj = market_sampler(rng_j, key)
+                Rj = np.asarray(Rj, float)
+                sigj = np.asarray(sigj, float).reshape(-1)
+                mult_j = sigj / base_sigmas_env
+                rr["sigmas"] = sig_base_reg * mult_j
+                rr["R"] = Rj
+            else:
+                rr["sigmas"] = sig_base_reg
+                rr["R"] = R_fallback
             regimes_ep.append(rr)
 
         return RegimeGBMBandEnvMulti(cfg=gcfg, regimes=regimes_ep, P=P, R=R_new)
