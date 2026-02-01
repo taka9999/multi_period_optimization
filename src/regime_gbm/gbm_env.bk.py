@@ -8,6 +8,9 @@ import cvxpy as cp
 
 from src.utils.rlopt_helpers import clamp01_vec
 
+
+
+
 @dataclass
 class globalsetting:
     seed: int = 42
@@ -36,10 +39,6 @@ class globalsetting:
     RISK_GAMMA: float = 1.0        # gamma in (1/2)*gamma*w^T Sigma w
     TARGET_ETA: float = 5.0        # eta in hinge penalty eta*[target - mu^T w]_+
     TARGET_RET_ANN: float = 0.05   # default annual target (discounted-by-bank world)
-        # --- regime obs (gamma) ---
-    # base global feats are [lam, target_ret_dt, port_var, ||R w||] = 4 dims
-    # if env provides self.gamma (len K), obs global dims become 4+K
-    REGIME_GAMMA_ON_OBS: bool = True
 
 
 def reflect_multi(S: np.ndarray,
@@ -326,8 +325,7 @@ class GBMBandEnvMulti:
     def _make_obs(self):
         """
         per-asset token features: [beta_i, w_i, sigma_i, (R@w)_i, lam]
-        global features base: [lam, target_ret_dt, port_var, ||R w||]
-        optionally append regime gamma (soft probs): [gamma_0,...,gamma_{K-1}]
+        global features: [lam, target_ret_dt, port_var, ||R w||]
         """
         lam_scalar = float(self.lam.mean()) if isinstance(self.lam, np.ndarray) else float(self.lam)
         Y = self.S.sum() + self.C
@@ -341,18 +339,7 @@ class GBMBandEnvMulti:
 
         port_var = float(w @ self.Cov @ w)
         rw_norm = float(np.linalg.norm(Rw))
-        base = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
-
-        # regime gamma (if present)
-        if bool(getattr(self.cfg, "REGIME_GAMMA_ON_OBS", True)) and hasattr(self, "gamma") and self.gamma is not None:
-            g = np.asarray(self.gamma, float).reshape(-1)
-            # safety: normalize
-            s = float(g.sum())
-            if np.isfinite(s) and s > 0:
-                g = g / s
-            global_feats = np.concatenate([base, g], axis=0)
-        else:
-            global_feats = base
+        global_feats = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
         return np.concatenate([per_asset_flat, global_feats], axis=0)
         
 

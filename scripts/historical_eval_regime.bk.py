@@ -27,7 +27,6 @@ import json
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
 
 import math
 import numpy as np
@@ -45,221 +44,6 @@ from src.regime_gbm.gbm_env import globalsetting
 
 globalcfg = globalsetting()   # <- instantiate
 
-# ============================================================
-# Gamma/entropy + perf stats utilities
-# ============================================================
-def entropy_from_gamma(gamma: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """
-    gamma: (T, K) rows sum to 1
-    entropy_t = -sum_k gamma_tk log(gamma_tk)
-    """
-    g = np.asarray(gamma, float)
-    g = np.clip(g, eps, 1.0)
-    g = g / (g.sum(axis=1, keepdims=True) + eps)
-    return -np.sum(g * np.log(g), axis=1)
-
-
-def max_drawdown_from_wealth(W: np.ndarray) -> float:
-    W = np.asarray(W, float).reshape(-1)
-    if W.size < 2:
-        return 0.0
-    peak = np.maximum.accumulate(W)
-    dd = W / (peak + 1e-12) - 1.0
-    return float(np.min(dd))  # negative
-
-
-def perf_stats_from_rsimple(rsimple: np.ndarray, *, dt: float, rf_ann: float = 0.0, mar: float = 0.0) -> Dict[str, float]:
-    """
-    rsimple: simple returns per step (daily)
-    dt:      step size in years (e.g., 1/252)
-    mar:     Minimum Acceptable Return (annual) for Sortino threshold.
-             Here default 0.0 is fine (excess-return view).
-    """
-    r = np.asarray(rsimple, float).reshape(-1)
-    if r.size == 0:
-        return dict(ret=np.nan, ann_mean=np.nan, ann_vol=np.nan, sharpe=np.nan, sortino=np.nan, maxdd=np.nan)
-
-    # wealth & total return
-    W = wealth_from_rsimple(r, w0=100.0)
-    tot_ret = float(W[-1] / W[0] - 1.0)
-
-    # annualized mean/vol (arith)
-    ann_mean = float(r.mean() / dt)
-    ann_vol  = float(r.std(ddof=1) / math.sqrt(dt)) if r.size >= 2 else 0.0
-    sharpe   = float((ann_mean - rf_ann) / (ann_vol + 1e-12))
-
-    # sortino (downside deviation vs MAR)
-    mar_step = float(mar * dt)
-    downside = np.minimum(0.0, r - mar_step)
-    ddv = float(np.sqrt(np.mean(downside**2)) / math.sqrt(dt))  # annualized downside vol
-    sortino = float((ann_mean - rf_ann) / (ddv + 1e-12))
-
-    # max drawdown
-    maxdd = max_drawdown_from_wealth(W)
-
-    return dict(
-        ret=tot_ret,
-        ann_mean=ann_mean,
-        ann_vol=ann_vol,
-        sharpe=sharpe,
-        sortino=sortino,
-        maxdd=maxdd,
-    )
-
-
-def _default_crash_windows() -> List[Dict[str, str]]:
-    """
-    Fixed representative crisis windows (US-centric; adjust freely).
-    Dates are inclusive bounds, will be clipped to window date index.
-    """
-    return [
-        dict(name="GFC",   start="2008-09-01", end="2009-03-31"),
-        dict(name="COVID", start="2020-02-15", end="2020-04-30"),
-        dict(name="Rates2022", start="2022-01-01", end="2022-10-31"),
-    ]
-
-
-def save_gamma_entropy_plots(
-    *,
-    dates: pd.DatetimeIndex,
-    gamma: np.ndarray,
-    out_png: str,
-    out_npz: str,
-    title: str = "HMM filtered regime prob (gamma) + entropy",
-):
-    """
-    Saves:
-      - out_npz: {dates, gamma, entropy}
-      - out_png: time series plot
-    """
-    dates = pd.DatetimeIndex(dates)
-    gamma = np.asarray(gamma, float)
-    ent = entropy_from_gamma(gamma)
-
-    Path(out_npz).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_npz,
-        dates=dates.astype("datetime64[ns]").values,
-        gamma=gamma,
-        entropy=ent,
-    )
-
-    K = gamma.shape[1]
-    fig = plt.figure(figsize=(12, 6))
-    ax1 = fig.add_subplot(2, 1, 1)
-    for k in range(K):
-        ax1.plot(dates, gamma[:, k], label=f"gamma{k}")
-    ax1.set_ylim(-0.02, 1.02)
-    ax1.set_title(title)
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(ncol=min(K, 4), fontsize=9)
-
-    ax2 = fig.add_subplot(2, 1, 2)
-    ax2.plot(dates, ent)
-    ax2.set_ylabel("entropy")
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_png, dpi=170)
-    plt.close(fig)
-
-# ============================================================
-# 0) Regime related helpers
-# ============================================================
-def _stationary_dist(P: np.ndarray) -> np.ndarray:
-    """Compute stationary dist of a Markov chain (fallback to uniform)."""
-    P = np.asarray(P, float)
-    K = P.shape[0]
-    try:
-        w, V = np.linalg.eig(P.T)
-        j = int(np.argmin(np.abs(w - 1.0)))
-        v = np.real(V[:, j])
-        v = np.maximum(v, 0.0)
-        s = float(v.sum())
-        if np.isfinite(s) and s > 0:
-            return v / s
-    except Exception:
-        pass
-    return np.full(K, 1.0 / K, dtype=float)
-
-def _regime_emission_params_from_regimes(regimes: list[dict], dt: float):
-    """
-    Convert regime dicts (beta/sigmas/R) -> Gaussian emission params for log-returns:
-      x_t ~ N(m_k, Cov_k)
-    Under your env: log return increment is
-      (sig^2*beta - 0.5*sig^2)*dt + sig*sqrt(dt)*z
-    If sigmas are annualized, Cov_k = Sigma_ann * dt.
-    """
-    mus = []
-    covs = []
-    for reg in regimes:
-        beta = np.asarray(reg["beta"], float).reshape(-1)
-        sig  = np.asarray(reg["sigmas"], float).reshape(-1)   # assume annualized
-        R    = np.asarray(reg["R"], float)
-        Sigma_ann = np.diag(sig) @ R @ np.diag(sig)
-        Cov_step = Sigma_ann * float(dt)
-        m_step = (sig**2 * beta - 0.5 * sig**2) * float(dt)
-        mus.append(m_step)
-        covs.append(Cov_step)
-    return np.asarray(mus, float), np.asarray(covs, float)
-
-def hmm_forward_filter_gaussian(X: np.ndarray, P: np.ndarray, pi: np.ndarray, mus: np.ndarray, covs: np.ndarray):
-    """
-    Forward filtering for Gaussian HMM.
-    Returns gamma[t,k] = P(z_t=k | x_1:t).
-    X: [T,N], mus:[K,N], covs:[K,N,N], P:[K,K], pi:[K]
-    """
-    X = np.asarray(X, float)
-    P = np.asarray(P, float)
-    pi = np.asarray(pi, float).reshape(-1)
-    K = P.shape[0]
-    T = X.shape[0]
-    N = X.shape[1]
-
-    # precompute log-likelihoods
-    logB = np.zeros((T, K), float)
-    const = -0.5 * N * np.log(2.0 * np.pi)
-    for k in range(K):
-        C = covs[k]
-        # stabilize
-        C = 0.5 * (C + C.T)
-        C = C + 1e-9 * np.eye(N)
-        L = np.linalg.cholesky(C)
-        logdet = 2.0 * np.sum(np.log(np.diag(L)))
-        invC = np.linalg.inv(C)
-        d = X - mus[k]
-        quad = np.einsum("ti,ij,tj->t", d, invC, d)
-        logB[:, k] = const - 0.5 * (logdet + quad)
-
-    # forward in log-space
-    logP = np.log(np.clip(P, 1e-300, None))
-    loga = np.log(np.clip(pi, 1e-300, None)) + logB[0]
-    # normalize
-    m = np.max(loga)
-    loga = loga - (m + np.log(np.sum(np.exp(loga - m))))
-    gamma = np.zeros((T, K), float)
-    gamma[0] = np.exp(loga)
-
-    for t in range(1, T):
-        # log alpha_t(j) = logB(t,j) + logsum_i( alpha_{t-1}(i) * P(i,j) )
-        prev = loga.reshape(K, 1) + logP  # [K,K]
-        m = np.max(prev, axis=0)
-        lse = m + np.log(np.sum(np.exp(prev - m), axis=0))
-        loga = logB[t] + lse
-        m2 = np.max(loga)
-        loga = loga - (m2 + np.log(np.sum(np.exp(loga - m2))))
-        gamma[t] = np.exp(loga)
-
-    return gamma
-
-def augment_obs_with_gamma(obs: np.ndarray, gamma_t: np.ndarray) -> np.ndarray:
-    obs = np.asarray(obs, float).reshape(-1)
-    g = np.asarray(gamma_t, float).reshape(-1)
-    s = float(g.sum())
-    if np.isfinite(s) and s > 0:
-        g = g / s
-    return np.concatenate([obs, g], axis=0)
 
 # ============================================================
 # 1) Data loading + column mapping to globalcfg.N_ASSETS
@@ -571,7 +355,6 @@ def run_episode_RL_band_A2_hist(
     mv_solver: str = "OSQP",
     infeasible_policy: str = "skip",
     force_s_one: bool = False,
-    gamma_seq: np.ndarray | None = None,
 ):
     cfg.seed = int(seed)
 
@@ -600,8 +383,6 @@ def run_episode_RL_band_A2_hist(
     rs = []
     for _t in range(env.T):
         o = np.array(obs, dtype=np.float32)
-        if gamma_seq is not None:
-            o = augment_obs_with_gamma(o, gamma_seq[_t])
         with torch.no_grad():
             if hasattr(policy, "sample_s_only"):
                 s_t, _, _ = policy.sample_s_only(torch.tensor(o, device=device).unsqueeze(0))
@@ -676,7 +457,6 @@ def run_episode_RL_band_B2_hist(
     mv_allow_cash: bool = False,
     force_s_one: bool = False,
     topk: int | None = None,
-    gamma_seq: np.ndarray | None = None,
 ):
     cfg.seed = int(seed)
 
@@ -714,8 +494,6 @@ def run_episode_RL_band_B2_hist(
     rs = []
     for _t in range(env.T):
         o = np.array(obs, dtype=np.float32)
-        if gamma_seq is not None:
-            o = augment_obs_with_gamma(o, gamma_seq[_t])
         if force_s_one:
             s = np.ones(N, dtype=float)
         else:
@@ -763,7 +541,6 @@ def eval_frontier_historical(
     mv_solver: str = "OSQP",
     qp_solver: str = "OSQP",
     infeasible_policy: str = "skip",
-    gamma_all: np.ndarray | None = None,
 ):
     N = cfg.N_ASSETS
     # R_corr is unused for historical center (we use Cov_ann), but env signature requires it.
@@ -783,9 +560,6 @@ def eval_frontier_historical(
 
         # random contiguous window start
         start_idx = int(rng.integers(0, T_max_start))
-        gamma_seq = None
-        if gamma_all is not None:
-            gamma_seq = gamma_all[start_idx:start_idx + T_days]
 
         for t_ann in targets:
             # MV daily
@@ -822,8 +596,7 @@ def eval_frontier_historical(
             rsA2 = run_episode_RL_band_A2_hist(
                 cfg, R_corr, returns_log, policy_A2, lam_cost, t_ann,
                 start_idx=start_idx, T_days=T_days, seed=seed, device=cfg.device,
-                mv_solver=mv_solver, infeasible_policy=infeasible_policy,
-                gamma_seq=gamma_seq
+                mv_solver=mv_solver, infeasible_policy=infeasible_policy
             )
             if rsA2 is None:
                 skipped["RL_band_A2"][t_ann] += 1
@@ -838,8 +611,7 @@ def eval_frontier_historical(
             rsB2 = run_episode_RL_band_B2_hist(
                 cfg, R_corr, returns_log, policy_B2, lam_cost, t_ann,
                 start_idx=start_idx, T_days=T_days, seed=seed, device=cfg.device,
-                mv_solver=mv_solver, qp_solver=qp_solver, infeasible_policy=infeasible_policy,
-                gamma_seq=gamma_seq
+                mv_solver=mv_solver, qp_solver=qp_solver, infeasible_policy=infeasible_policy
             )
             if rsB2 is None:
                 skipped["RL_band_B2"][t_ann] += 1
@@ -928,7 +700,7 @@ def plot_wealth_overlay_grid(
         c = k % ncols
         ax = axes[r][c]
 
-        dates = pd.DatetimeIndex(df_sel.index[start_idx : start_idx + T_days])
+        dates = df_sel.index[start_idx : start_idx + T_days + 1]
 
         rs_mv_d = run_episode_MV_daily_frictionless_hist(
             cfg, np.eye(cfg.N_ASSETS), returns_log, target_ann,
@@ -964,10 +736,8 @@ def plot_wealth_overlay_grid(
 
         for label, rs in curves:
             W = wealth_from_rsimple(rs, 100.0)
-            dates_r = dates[:len(rs)]
-            dates_w = dates_r.insert(0, dates_r[0])
             y = safe_log_wealth(W) if log_scale else W
-            ax.plot(dates_w, y, label=label)
+            ax.plot(dates, y, label=label)
 
         ax.grid(True, alpha=0.3)
         ax.set_title(f"Window {k+1}/{n} | start_idx={start_idx} | target={target_ann:.3f}")
@@ -1035,197 +805,6 @@ def plot_frontier_save(res, targets, title, out_png: str):
     plt.savefig(out_png, dpi=160)
     plt.close()
 
-# ============================================================
-# 6.5) Wealth overlay with stats box + crash windows + gamma plots
-# ============================================================
-def _fmt_stats_box(stats: Dict[str, float]) -> str:
-    """
-    Compact multi-line text for matplotlib.
-    """
-    if stats is None or any(np.isnan(stats.get(k, np.nan)) for k in ["ann_mean", "ann_vol"]):
-        return "N/A"
-    return (
-        f"TotRet:  {stats['ret']*100:6.2f}%\n"
-        f"AnnRet:  {stats['ann_mean']*100:6.2f}%\n"
-        f"AnnVol:  {stats['ann_vol']*100:6.2f}%\n"
-        f"Sharpe:  {stats['sharpe']:6.2f}\n"
-        f"Sortino: {stats['sortino']:6.2f}\n"
-        f"MaxDD:   {stats['maxdd']*100:6.2f}%"
-    )
-
-
-def _slice_by_dates(
-    dates: pd.DatetimeIndex,
-    rsimple: np.ndarray,
-    start: str,
-    end: str,
-) -> np.ndarray:
-    """
-    Slice rsimple using date bounds; handles missing dates via searchsorted.
-    """
-    dates = pd.DatetimeIndex(dates)
-    r = np.asarray(rsimple, float).reshape(-1)
-    if r.size == 0:
-        return r
-    # wealth has length r+1; but for stats we slice rsimple aligned with dates[0:len(r)]
-    n = min(len(dates), len(r))
-    dates2 = dates[:n]
-    i0 = int(dates2.searchsorted(pd.Timestamp(start), side="left"))
-    i1 = int(dates2.searchsorted(pd.Timestamp(end), side="right"))
-    return r[i0:i1]
-
-
-def plot_wealth_overlay_grid_with_stats(
-    *,
-    df_sel: pd.DataFrame,
-    returns_log: np.ndarray,
-    cfg,
-    policy_A2,
-    policy_B2,
-    target_ann: float,
-    lam_cost: float,
-    rebalance_every: int,
-    T_days: int,
-    n_windows: int,
-    base_seed: int,
-    out_png: str,
-    out_dir: str,
-    log_scale: bool = True,
-    crash_windows: Optional[List[Dict[str, str]]] = None,
-    # gamma: pass precomputed (T_window, K) for the *whole eval slice* if you have it
-    gamma_full: Optional[np.ndarray] = None,
-    gamma_dates: Optional[pd.DatetimeIndex] = None,
-):
-    """
-    Makes a grid of wealth overlays (n_windows windows), and:
-      - stats box per window per strategy
-      - highlight crash windows
-      - output crash-window stats CSV for each strategy
-    """
-    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    if crash_windows is None:
-        crash_windows = _default_crash_windows()
-
-    # choose random contiguous windows
-    rng = np.random.default_rng(int(base_seed))
-    T_max_start = int(returns_log.shape[0] - T_days - 1)
-    if T_max_start <= 0:
-        raise ValueError("Not enough data for wealth windows.")
-    starts = [int(rng.integers(0, T_max_start)) for _ in range(int(n_windows))]
-
-    # prepare crash stats rows
-    crash_rows: List[Dict[str, Any]] = []
-
-    # subplot grid
-    nW = int(n_windows)
-    ncols = int(math.ceil(math.sqrt(nW)))
-    nrows = int(math.ceil(nW / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5*ncols, 3.6*nrows), squeeze=False)
-
-    for i, start_idx in enumerate(starts):
-        ax = axes[i // ncols][i % ncols]
-        # window dates
-        win_df = df_sel.iloc[start_idx:start_idx + T_days]
-        dates = pd.DatetimeIndex(win_df.index)
-        # --- run strategies (rsimple) ---
-        rs_mv_daily = run_episode_MV_daily_frictionless_hist(
-            cfg, np.eye(cfg.N_ASSETS), returns_log, target_ann,
-            start_idx=start_idx, T_days=T_days, seed=base_seed + i,
-            mv_solver="OSQP", infeasible_policy="fallback",
-        )
-        rs_mv_monthly = run_episode_MV_monthly_cost_hist(
-            cfg, np.eye(cfg.N_ASSETS), returns_log, lam_cost, target_ann,
-            start_idx=start_idx, T_days=T_days, rebalance_every=rebalance_every, seed=base_seed + i,
-            mv_solver="OSQP", infeasible_policy="fallback",
-        )
-        rs_a2 = run_episode_RL_band_A2_hist(
-            cfg, np.eye(cfg.N_ASSETS), returns_log, policy_A2, lam_cost, target_ann,
-            start_idx=start_idx, T_days=T_days, seed=base_seed + i,
-            device=cfg.device, mv_solver="OSQP", infeasible_policy="fallback",
-        )
-        rs_b2 = run_episode_RL_band_B2_hist(
-            cfg, np.eye(cfg.N_ASSETS), returns_log, policy_B2, lam_cost, target_ann,
-            start_idx=start_idx, T_days=T_days, seed=base_seed + i,
-            device=cfg.device, mv_solver="OSQP", qp_solver="OSQP", infeasible_policy="fallback",
-        )
-
-        series = [
-            ("MV_daily", rs_mv_daily),
-            ("MV_monthly", rs_mv_monthly),
-            ("RL_A2", rs_a2),
-            ("RL_B2", rs_b2),
-        ]
-
-        # plot wealth & stats box (aggregate for full window)
-        y_max = None
-        box_lines = []
-        for name, rs in series:
-            if rs is None:
-                continue
-            W = wealth_from_rsimple(rs, 100.0)
-            y = safe_log_wealth(W) if log_scale else W
-            ax.plot(dates.insert(0, dates[0]), y, label=name)  # align W length = T+1
-            y_max = float(np.max(y)) if y_max is None else float(max(y_max, np.max(y)))
-            st = perf_stats_from_rsimple(rs, dt=float(cfg.dt_day))
-            box_lines.append(f"[{name}]\n{_fmt_stats_box(st)}")
-
-            # crash-window stats
-            for cw in crash_windows:
-                rsub = _slice_by_dates(dates, rs, cw["start"], cw["end"])
-                st_cw = perf_stats_from_rsimple(rsub, dt=float(cfg.dt_day))
-                crash_rows.append(dict(
-                    window=i,
-                    start=str(dates[0].date()) if len(dates) else "",
-                    end=str(dates[-1].date()) if len(dates) else "",
-                    strategy=name,
-                    crash_name=cw["name"],
-                    crash_start=cw["start"],
-                    crash_end=cw["end"],
-                    **st_cw,
-                ))
-        # crash highlights
-        for cw in crash_windows:
-            s = pd.Timestamp(cw["start"])
-            e = pd.Timestamp(cw["end"])
-            # clip into [dates[0], dates[-1]]
-            if len(dates) == 0:
-                continue
-            s2 = max(s, dates[0])
-            e2 = min(e, dates[-1])
-            if s2 <= e2:
-                ax.axvspan(s2, e2, alpha=0.10)
-
-        ax.set_title(f"window {i}  ({dates[0].date()} → {dates[-1].date()})")
-        ax.grid(True, alpha=0.3)
-        ax.set_ylabel("log(wealth)" if log_scale else "wealth (base=100)")
-        ax.legend(fontsize=8, loc="upper left")
-
-        # stats box on the right
-        if box_lines:
-            txt = "\n\n".join(box_lines)
-            ax.text(
-                1.01, 0.98, txt,
-                transform=ax.transAxes,
-                va="top", ha="left",
-                fontsize=8,
-                bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
-            )
-
-    # hide empty axes
-    for j in range(nW, nrows*ncols):
-        axes[j // ncols][j % ncols].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=170)
-    plt.close(fig)
-
-    # crash stats CSV
-    if crash_rows:
-        df_c = pd.DataFrame(crash_rows)
-        df_c.to_csv(Path(out_dir) / "crash_window_stats.csv", index=False)
-
 def summaries_to_frames(resA, resG, shA, shG, targets):
     rowsA, rowsG = [], []
     for s in resA.keys():
@@ -1236,206 +815,162 @@ def summaries_to_frames(resA, resG, shA, shG, targets):
             rowsG.append(dict(strategy=s, target=float(t), mean=float(m2), vol=float(v2), sharpe=float(shG[s][t])))
     return pd.DataFrame(rowsA), pd.DataFrame(rowsG)
 
-def parse_crash_windows(s: str):
-    """
-    Parse crash windows string into list of dicts.
-
-    Format:
-      "NAME:YYYY-MM-DD:YYYY-MM-DD;NAME2:YYYY-MM-DD:YYYY-MM-DD"
-
-    Example:
-      "GFC:2008-09-01:2009-03-31;COVID:2020-02-15:2020-04-30"
-    """
-    if s is None or s.strip() == "":
-        return None
-
-    windows = []
-    for part in s.split(";"):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            name, start, end = part.split(":")
-        except ValueError:
-            raise ValueError(
-                f"Invalid crash window spec '{part}'. "
-                "Expected format NAME:YYYY-MM-DD:YYYY-MM-DD"
-            )
-        windows.append(
-            dict(
-                name=name,
-                start=start,
-                end=end,
-            )
-        )
-    return windows
-
 
 # ============================================================
 # 7) MAIN
 # ============================================================
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, required=True)
-    ap.add_argument("--cols", type=str, required=True)
-    ap.add_argument("--rf-col", type=str, default=None)
-    ap.add_argument("--no-subtract-rf", action="store_true")
-    ap.add_argument("--eval_start", type=str, default=None)
-    ap.add_argument("--eval_end", type=str, default=None)
-    ap.add_argument("--T_days", type=int, default=1260)
+    ap.add_argument("--data", type=str, default="asset_data/asset_returns.pkl")
+    ap.add_argument("--cols", type=str, default="LargeCap,MidCap,SmallCap,EAFE,EM")
+    ap.add_argument("--policy_a2", type=str, default="checkpoints_regime_A2/policy_stage2_A2_regime.pt")
+    ap.add_argument("--policy_b2", type=str, default="checkpoints_regime_B2/policy_stage2_B2_finetuned.pt")
+    ap.add_argument("--targets", type=str, default="0.02:0.12:0.004")  # start:stop:step
     ap.add_argument("--n_eps", type=int, default=30)
-    ap.add_argument("--dt", type=float, default=1.0/252)
+    ap.add_argument("--T_days", type=int, default=252*5)
+    ap.add_argument("--lam", type=float, default=0.99)
+    ap.add_argument("--rebalance_every", type=int, default=21)
+    ap.add_argument("--out_dir", type=str, default="outputs/historical")
+    ap.add_argument("--run_name", type=str, default=None)
+    ap.add_argument("--eval_start", type=str, default=None, help="YYYY-MM-DD (slice data for evaluation)")
+    ap.add_argument("--eval_end", type=str, default=None, help="YYYY-MM-DD (slice data for evaluation)")
 
-    # regime json for filtering gamma_t
-    ap.add_argument("--regime_json", type=str, default=None,
-                    help="Regime JSON containing {P, regimes:[{beta,sigmas,R},...]}. "
-                         "If provided, forward-filter gamma_t and append to obs.")
-
-    # policy/value paths
-    ap.add_argument("--policy_A2", type=str, default=None)
-    ap.add_argument("--policy_B2", type=str, default=None)
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-
-    # --- gamma plots (historical HMM filtering outputs) ---
-    ap.add_argument("--plot_gamma", action="store_true", help="Save gamma/entropy plots (requires regime_json usage in this script).")
-    ap.add_argument("--gamma_prefix", type=str, default="gamma", help="prefix for gamma outputs (png/npz).")
-
-    # --- wealth overlay extras ---
-    ap.add_argument("--crash_windows", type=str, default="", help="Optional crash windows. Format: name:start:end;name:start:end ... (ISO dates)")
-
-    ap.add_argument("--plot_wealth", action="store_true")
+    ap.add_argument("--plot_wealth", action="store_true", help="Also plot wealth overlay grids.")
     ap.add_argument("--wealth_target", type=float, default=0.06)
     ap.add_argument("--wealth_windows", type=int, default=4)
-    ap.add_argument("--wealth_log", action="store_true")
+    ap.add_argument("--wealth_log", action="store_true", help="Plot log(wealth) (recommended).")
 
-
+    ap.add_argument("--base_seed", type=int, default=2025)
+    ap.add_argument("--mv_solver", type=str, default="OSQP")
+    ap.add_argument("--qp_solver", type=str, default="OSQP")
+    ap.add_argument("--infeasible_policy", type=str, default="skip")
+    ap.add_argument("--no_show", action="store_true", help="Do not show plots (still saves png).")
     args = ap.parse_args()
 
-    df = pd.read_pickle(args.data)
-    cols = [c.strip() for c in args.cols.split(",") if c.strip()]
-    df_sel = df[cols].copy()
-    if args.rf_col is not None and (not args.no_subtract_rf):
-        rf = df[args.rf_col].astype(float)
-        df_sel = df_sel.sub(rf, axis=0)    
+    DATA_PKL = args.data
+    PREFER_COLS = [c.strip() for c in args.cols.split(",") if c.strip()]
+    policy_path_A2 = args.policy_a2
+    policy_path_B2 = args.policy_b2
+
+    # parse targets "a:b:step"
+    if ":" in args.targets:
+        a, b, st = args.targets.split(":")
+        targets = np.arange(float(a), float(b), float(st))
+    else:
+        targets = np.array([float(x) for x in args.targets.split(",") if x.strip()], float)
+    n_eps = int(args.n_eps)
+    T_days = int(args.T_days)
+    lam_cost = float(args.lam)
+    rebalance_every = int(args.rebalance_every)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = args.run_name or f"hist_{ts}_eps{n_eps}_T{T_days}_lam{lam_cost:.3f}"
+    out_root = Path(args.out_dir) / run_name
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # ----- load returns -----
+    N = int(globalcfg.N_ASSETS)
+    df_sel, Rlog, cols = load_historical_log_returns(DATA_PKL, N, prefer_cols=PREFER_COLS)
+    # apply eval period slice (BEFORE dropna window sampling)
     df_sel = apply_eval_date_range(df_sel, args.eval_start, args.eval_end)
+    df_sel = df_sel.dropna(axis=0, how="any")
+    Rlog = df_sel.to_numpy(dtype=float)
 
-    returns_log = df_sel.to_numpy(dtype=float)  # [T, N]
+    print(f"[data] selected columns (N={N}): {cols}")
+    print(f"[data] usable rows after eval-slice+dropna: {len(df_sel)} (from {DATA_PKL})")
+    if args.eval_start or args.eval_end:
+        print(f"[data] eval range: start={args.eval_start} end={args.eval_end}")
 
-    # load regimes -> precompute gamma for full sample (cheap)
-    gamma_all = None
-    K = 0
-    if args.regime_json is not None:
-        with open(args.regime_json, "r") as f:
-            data = json.load(f)
-        regimes = data["regimes"]
-        P = np.asarray(data["P"], float)
-        mus, covs = _regime_emission_params_from_regimes(regimes, dt=float(args.dt))
-        pi = _stationary_dist(P)
-        gamma_all = hmm_forward_filter_gaussian(returns_log, P, pi, mus, covs)  # [T,K]
-        K = gamma_all.shape[1]
-        print(f"[HMM] computed gamma_all: T={gamma_all.shape[0]} K={K}")
+    # Ensure contiguous windows possible
+    if Rlog.shape[0] < T_days + 10:
+        raise ValueError(f"Not enough history after dropna: T={Rlog.shape[0]} < T_days={T_days}")
 
-    # ----- load policies (if provided) -----
-    device = torch.device(args.device)
-    N = len(cols)
-    # IMPORTANT: if you use gamma, policy/value must be instantiated with global_dim=4+K
-    global_dim = 4 + (K if gamma_all is not None else 0)
-    policyA2 = None
-    policyB2 = None
-    if args.policy_A2 is not None:
-        policyA2 = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True, global_dim=global_dim).to(device)
-        policyA2.load_state_dict(torch.load(args.policy_A2, map_location=device))
-        policyA2.eval()
-    if args.policy_B2 is not None:
-        policyB2 = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True, global_dim=global_dim).to(device)
-        policyB2.load_state_dict(torch.load(args.policy_B2, map_location=device))
-        policyB2.eval()
-    
-    # ============================================================
-    # 8) Frontier evaluation (HISTORICAL)
-    # ============================================================
-    targets = np.linspace(0.02, 0.10, 9)   # 2% ～ 10% 年率ターゲット
-    lam_cost = 0.99
-    rebalance_every = 21
+    # ----- load policies -----
+    policy_A2 = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True)
+    policy_A2.load_state_dict(torch.load(policy_path_A2, map_location=globalcfg.device))
+    policy_A2.to(globalcfg.device).eval()
 
-    print("[Frontier] evaluating historical frontier ...")
+    policy_B2 = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True)
+    policy_B2.load_state_dict(torch.load(policy_path_B2, map_location=globalcfg.device))
+    policy_B2.to(globalcfg.device).eval()
+
+    # ----- run eval -----
     resA, resG, shA, shG, raw, info = eval_frontier_historical(
         globalcfg,
-        returns_log,
-        targets,
-        policy_A2=policyA2,
-        policy_B2=policyB2,
-        n_eps=args.n_eps,
+        returns_log=Rlog,
+        targets=targets,
+        policy_A2=policy_A2,
+        policy_B2=policy_B2,
+        n_eps=n_eps,
         lam_cost=lam_cost,
         rebalance_every=rebalance_every,
-        T_days=args.T_days,
-        base_seed=2025,
+        T_days=T_days,
+        base_seed=int(args.base_seed),
+        mv_solver=str(args.mv_solver),
+        qp_solver=str(args.qp_solver),
+        infeasible_policy=str(args.infeasible_policy),
     )
 
-    outdir = Path("outputs/historical")
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # ============================================================
-    # 9) Save frontier plots
-    # ============================================================
-    plot_frontier_save(
-        resA,
-        targets,
-        title="Historical Frontier (Arithmetic)",
-        out_png=str(outdir / "frontier_arithmetic.png"),
-    )
-
-    plot_frontier_save(
-        resG,
-        targets,
-        title="Historical Frontier (Geometric)",
-        out_png=str(outdir / "frontier_geometric.png"),
-    )
-
-    # also save tables
     dfA, dfG = summaries_to_frames(resA, resG, shA, shG, targets)
-    dfA.to_csv(outdir / "frontier_arithmetic.csv", index=False)
-    dfG.to_csv(outdir / "frontier_geometric.csv", index=False)
+    dfA.to_csv(out_root / "summary_arith.csv", index=False)
+    dfG.to_csv(out_root / "summary_geom.csv", index=False)
+    with open(out_root / "summary.json", "w") as f:
+        json.dump(
+            dict(
+                run_name=run_name,
+                data=str(DATA_PKL),
+                cols=cols,
+                targets=[float(t) for t in targets],
+                n_eps=n_eps,
+                T_days=T_days,
+                lam_cost=lam_cost,
+                rebalance_every=rebalance_every,
+                base_seed=int(args.base_seed),
+                mv_solver=str(args.mv_solver),
+                qp_solver=str(args.qp_solver),
+                infeasible_policy=str(args.infeasible_policy),
+                skipped=info.get("skipped", {}),
+            ),
+            f,
+            indent=2,
+        )
+    pd.to_pickle(raw, out_root / "raw.pkl")
+    plot_frontier_save(resA, targets, "Historical Frontier (Arithmetic)", str(out_root / "frontier_arith.png"))
+    plot_frontier_save(resG, targets, "Historical Frontier (Geometric / log1p)", str(out_root / "frontier_geom.png"))
 
-    print("[Frontier] saved plots + csv")
-
-    # ============================================================
-    # 10) Wealth overlay with stats + crash windows
-    # ============================================================
-    print("[Wealth] plotting wealth overlay ...")
-
+    # ----- optional wealth overlay -----
     if args.plot_wealth:
-        plot_wealth_overlay_grid_with_stats(
-            df_sel=df_sel,
-            returns_log=returns_log,
-            cfg=globalcfg,
-            policy_A2=policyA2,
-            policy_B2=policyB2,
-            target_ann=args.wealth_target,
-            lam_cost=0.99,
-            rebalance_every=21,
-            T_days=args.T_days,
-            n_windows=args.wealth_windows,
-            base_seed=2025,
-            out_png="outputs/wealth_overlay.png",
-            out_dir="outputs",
-            log_scale=args.wealth_log,
-            crash_windows=parse_crash_windows(args.crash_windows),
+        out_png = str(out_root / "wealth_overlay.png")
+        plot_wealth_overlay_grid(
+            df_sel=df_sel, returns_log=Rlog, cfg=globalcfg,
+            policy_A2=policy_A2, policy_B2=policy_B2,
+            target_ann=float(args.wealth_target),
+            T_days=T_days, lam_cost=lam_cost, rebalance_every=rebalance_every,
+            n_windows=int(args.wealth_windows),
+            seed=int(args.base_seed) + 777,
+            log_scale=bool(args.wealth_log),
+            mv_solver=str(args.mv_solver), qp_solver=str(args.qp_solver),
+            out_png=out_png,
         )
 
-    # ============================================================
-    # 11) Gamma / entropy plots (optional)
-    # ============================================================
-    if args.plot_gamma and gamma_all is not None:
-        save_gamma_entropy_plots(
-            dates=df_sel.index,
-            gamma=gamma_all,
-            out_png=str(outdir / f"{args.gamma_prefix}.png"),
-            out_npz=str(outdir / f"{args.gamma_prefix}.npz"),
-            title="Filtered Regime Probabilities (Historical)",
-        )
-        print("[Gamma] saved gamma / entropy plots")
+    print(f"[Saved] {out_root}")
 
-    print("=== DONE ===")
+    # ----- print summary -----
+    print("\n=== Arithmetic (mean, vol, Sharpe) ===")
+    for s in resA.keys():
+        print(f"\n[{s}]")
+        for t in targets:
+            m, v = resA[s][t]
+            print(f"  target={t: .3f}  mean={m: .4f}  vol={v: .4f}  Sharpe={shA[s][t]: .3f}")
 
+    print("\n=== Geometric (mean, vol, Sharpe) ===")
+    for s in resG.keys():
+        print(f"\n[{s}]")
+        for t in targets:
+            m, v = resG[s][t]
+            print(f"  target={t: .3f}  mean={m: .4f}  vol={v: .4f}  Sharpe={shG[s][t]: .3f}")
 
+    # ----- plot -----
+    if not args.no_show:
+        plot_frontier(resA, targets, "Historical Frontier (Arithmetic)")
+        plot_frontier(resG, targets, "Historical Frontier (Geometric / log1p)")

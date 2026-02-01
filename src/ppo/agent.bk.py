@@ -5,6 +5,8 @@ import torch.nn as nn
 
 from src.utils.rlopt_helpers import project_simplex_leq1
 
+
+
 @dataclass
 class PPOConfig:
     horizon: int = 5*252
@@ -21,8 +23,6 @@ class PPOConfig:
     entropy_coef: float = 0.02
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
-    # obs global feature size (base=4; add K dims for regime gamma if used)
-    global_dim: int = 4
 
 class TokenEncoder(nn.Module):
     def __init__(self, per_dim: int, d_model: int):
@@ -33,13 +33,12 @@ class TokenEncoder(nn.Module):
         return self.proj(x_tok)
 
 class JointTransformerBody(nn.Module):
-    def __init__(self, N:int, per_dim:int=5, global_dim:int=4, d_model:int=128, nhead:int=4, nlayers:int=2, dropout:float=0.0):
+    def __init__(self, N:int, per_dim:int=5, d_model:int=128, nhead:int=4, nlayers:int=2, dropout:float=0.0):
         super().__init__()
         self.N = N
         self.d_model = d_model
-        self.global_dim = int(global_dim)
         self.token_enc = nn.Linear(per_dim, d_model)
-        self.glob_proj = nn.Linear(self.global_dim, d_model, bias=False)
+        self.glob_proj = nn.Linear(4, d_model, bias=False)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=4*d_model,
@@ -56,13 +55,8 @@ class JointTransformerBody(nn.Module):
         if global_feats is not None:
             if global_feats.ndim != 2:
                 raise RuntimeError(f"global_feats ndim must be 2, got {global_feats.ndim}")
-            # tolerate mismatch: crop/pad to self.global_dim
-            if global_feats.size(1) > self.global_dim:
-                global_feats = global_feats[:, -self.global_dim:]
-            elif global_feats.size(1) < self.global_dim:
-                pad = torch.zeros((B, self.global_dim - global_feats.size(1)),
-                                  device=global_feats.device, dtype=global_feats.dtype)
-                global_feats = torch.cat([global_feats, pad], dim=1)
+            if global_feats.size(1) != 4:
+                global_feats = global_feats[:, -4:]
             g = torch.nn.functional.gelu(self.glob_proj(global_feats))
             cls = cls + g.unsqueeze(1)
         x = torch.cat([cls, h], dim=1)
@@ -76,11 +70,10 @@ class JointBandPolicy(nn.Module):
       - widths s in (0,1)^N
     ログ確率は“事前の独立 Sigmoid 変数”に対して計算し、射影は stop-grad で適用（実務で安定）。
     """
-    def __init__(self, N:int, d_model:int=128, nlayers:int=2, nhead:int=4, use_cash_softmax:bool=False, global_dim:int=4):
+    def __init__(self, N:int, d_model:int=128, nlayers:int=2, nhead:int=4, use_cash_softmax:bool=False):
         super().__init__()
         self.N = N
-        self.global_dim = int(global_dim)
-        self.body = JointTransformerBody(N, per_dim=5, global_dim=self.global_dim, d_model=d_model, nhead=nhead, nlayers=nlayers)
+        self.body = JointTransformerBody(N, per_dim=5, d_model=d_model, nhead=nhead, nlayers=nlayers)
         self.head_m = nn.Linear(d_model, 1)   # per-asset
         self.head_s = nn.Linear(d_model, 1)
         self.log_std_m = nn.Parameter(torch.tensor(-0.7))
@@ -96,22 +89,15 @@ class JointBandPolicy(nn.Module):
         return m_mu, s_mu
 
     @staticmethod
-    def _build_tokens(obs: torch.Tensor, N: int, global_dim: int,):
+    def _build_tokens(obs: torch.Tensor, N: int):
         B = obs.size(0)
         per  = obs[:, :N*5].view(B, N, 5).contiguous()
-        glob = obs[:, N*5:].contiguous()
-        # tolerate mismatch: crop/pad to global_dim
-        if glob.size(1) > global_dim:
-            glob = glob[:, -global_dim:]
-        elif glob.size(1) < global_dim:
-            pad = torch.zeros((B, global_dim - glob.size(1)),
-                              device=glob.device, dtype=glob.dtype)
-            glob = torch.cat([glob, pad], dim=1)
+        glob = obs[:, N*5:N*5+4].contiguous()      # ★ここで4次元に固定
         return per, glob
 
     def sample(self, obs: torch.Tensor, deterministic: bool=False):
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs, N)
         cls_out, tok_out = self.body(per, glob)           # [B,d], [B,N,d]
         m_mu, s_mu = self.forward_heads(cls_out, tok_out)
 
@@ -169,7 +155,7 @@ class JointBandPolicy(nn.Module):
         戻り値: s_t(0,1), logp_s(合計), s_pre(0,1)  ※ logprob_s_only と同じ前提
         """
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs, N)
         cls_out, tok_out = self.body(per, glob)
 
         s_mu = self.head_s(tok_out).squeeze(-1)           # [B,N]
@@ -182,13 +168,13 @@ class JointBandPolicy(nn.Module):
         return s_i, logp_s, s_i.detach()
     
     @torch.no_grad()
-    def sample_stage2(self, obs: torch.Tensor):
+    def sample_stage2(self, o: torch.Tensor):
         """
         Stage-2 用: m は決定論（平均）で固定、s だけサンプル。
         m の決定論出力は self.sample() と完全に同じ射影規則に従う。
         """
-        B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        B = o.size(0); N = self.N
+        per, glob = self._build_tokens(o, N)
         cls, tok  = self.body(per, glob)
 
         # --- m を決定論で ---
@@ -203,7 +189,7 @@ class JointBandPolicy(nn.Module):
             m_t   = project_simplex_leq1(m_sig)             # sample() と同じ射影
 
         # --- s を確率化 ---
-        s_t, logp_s, s_pre = self.sample_s_only(obs)          # 下の変更②参照
+        s_t, logp_s, s_pre = self.sample_s_only(o)          # 下の変更②参照
 
         # m_pre は PPO で使わないが、整合性のため返すなら (0,1) に射影後を返す
         m_pre = m_t
@@ -217,7 +203,7 @@ class JointBandPolicy(nn.Module):
         - use_cash_softmax=False: m_pre は (0,1)（sigmoid結果）を渡す。
         """
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs, N)
         cls_out, tok_out = self.body(per, glob)
         m_mu = self.head_m(tok_out).squeeze(-1)           # [B,N]
         std_m = torch.exp(self.log_std_m)
@@ -235,7 +221,7 @@ class JointBandPolicy(nn.Module):
 
     def logprob_s_only(self, obs: torch.Tensor, s_pre: torch.Tensor) -> torch.Tensor:
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs, N)
         cls_out, tok_out = self.body(per, glob)
         s_mu = self.head_s(tok_out).squeeze(-1)          # [B,N]
         std_s = torch.exp(self.log_std_s)
@@ -248,7 +234,7 @@ class JointBandPolicy(nn.Module):
     
     def logprob(self, obs: torch.Tensor, m_pre: torch.Tensor, s_pre: torch.Tensor):
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs, N)
         cls_out, tok_out = self.body(per, glob)
         m_mu, s_mu = self.forward_heads(cls_out, tok_out)
         std_m = torch.exp(self.log_std_m); std_s = torch.exp(self.log_std_s)
@@ -274,25 +260,16 @@ class JointBandPolicy(nn.Module):
         return logp_m + logp_s
 
 class ValueNetCLS(nn.Module):
-    def __init__(self, N:int, d_model:int=128, nlayers:int=2, nhead:int=4, global_dim:int=4):
+    def __init__(self, N:int, d_model:int=128, nlayers:int=2, nhead:int=4):
         super().__init__()
-        self.N = int(N)
-        self.global_dim = int(global_dim)
-        self.body = JointTransformerBody(N, per_dim=5, global_dim = self.global_dim,d_model=d_model, nhead=nhead, nlayers=nlayers)
+        self.body = JointTransformerBody(N, per_dim=5, d_model=d_model, nhead=nhead, nlayers=nlayers)
         self.head = nn.Sequential(
             nn.Linear(d_model, d_model), nn.GELU(),
             nn.Linear(d_model, 1)
         )
     def forward(self, obs: torch.Tensor):
-        B = obs.size(0)
-        N = self.N
-        per = obs[:, :N*5].view(B, N, 5).contiguous()
-        glob = obs[:, N*5:].contiguous()
-        if glob.size(1) > self.global_dim:
-            glob = glob[:, -self.global_dim:]
-        elif glob.size(1) < self.global_dim:
-            pad = torch.zeros((B, self.global_dim - glob.size(1)),
-                              device=glob.device, dtype=glob.dtype)
-            glob = torch.cat([glob, pad], dim=1)
+        N = (obs.size(1)-4)//5
+        per = obs[:, :N*5].view(obs.size(0), N, 5)
+        glob = obs[:, N*5:]
         cls_out, _ = self.body(per, glob)
         return self.head(cls_out).squeeze(-1)

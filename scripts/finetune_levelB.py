@@ -18,6 +18,31 @@ from src.regime_gbm.regime_gbm_env import RegimeGBMBandEnvMulti
 from src.utils.rlopt_helpers import build_corr_from_pairs
 
 
+def _load_state_dict_shape_safe(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """Load a state_dict but skip keys with shape mismatch.
+
+    When adding regime gamma to obs, `global_dim` becomes 4+K and some layers
+    (notably `JointTransformerBody.glob_proj`) change their parameter shapes.
+    `torch.nn.Module.load_state_dict(strict=False)` still errors on shape mismatch,
+    so we filter mismatched keys manually.
+    """
+    cur = model.state_dict()
+    filtered: Dict[str, torch.Tensor] = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in cur and tuple(cur[k].shape) == tuple(v.shape):
+            filtered[k] = v
+        else:
+            skipped.append(k)
+    msg = model.load_state_dict(filtered, strict=False)
+    return {
+        "loaded": list(filtered.keys()),
+        "skipped": skipped,
+        "missing": list(msg.missing_keys),
+        "unexpected": list(msg.unexpected_keys),
+    }
+
+
 # ------------------------------
 # Domain randomization utilities
 # ------------------------------
@@ -681,15 +706,42 @@ if __name__ == "__main__":
         # Rollout 側の API 的に R が必要な箇所があるのでダミーを渡す
         R = np.eye(gcfg.N_ASSETS, dtype=float)
 
+    # ============================================================
+    # Regime gamma in obs => match network/PPOConfig global_dim
+    #   base global feats = 4 dims, plus K dims for regime gamma.
+    # ============================================================
+    if regimes is None:
+        gcfg.REGIME_GAMMA_ON_OBS = False
+        K = 0
+    else:
+        gcfg.REGIME_GAMMA_ON_OBS = True
+        K = int(len(regimes))
+
     cfg = PPOConfig()
     cfg.batch_episodes = 32          # B rollout重いのでまず小さめ推奨
     cfg.epochs = 4
     cfg.minibatch_size = 4096
+    cfg.global_dim = 4 + K
 
-    policy = JointBandPolicy(gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True)
-    valuef = ValueNetCLS(gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4)
-    policy.load_state_dict(torch.load(args.policy_in, map_location=gcfg.device))
-    valuef.load_state_dict(torch.load(args.value_in, map_location=gcfg.device))
+    policy = JointBandPolicy(
+        gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
+        use_cash_softmax=True,
+        global_dim=cfg.global_dim,
+    ).to(gcfg.device)
+    valuef = ValueNetCLS(
+        gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
+        global_dim=cfg.global_dim,
+    ).to(gcfg.device)
+
+    # NOTE: if you load a checkpoint trained without regime gamma (global_dim=4)
+    # into a model with regime gamma (global_dim=4+K), some weights will mismatch.
+    # We load only matching-shape tensors and leave the rest randomly initialized.
+    pi_sd = torch.load(args.policy_in, map_location=gcfg.device)
+    v_sd  = torch.load(args.value_in,  map_location=gcfg.device)
+    pi_msg = _load_state_dict_shape_safe(policy, pi_sd)
+    v_msg  = _load_state_dict_shape_safe(valuef, v_sd)
+    print(f"[load] policy: loaded={len(pi_msg['loaded'])}, skipped={len(pi_msg['skipped'])}, missing={len(pi_msg['missing'])}")
+    print(f"[load] value : loaded={len(v_msg['loaded'])}, skipped={len(v_msg['skipped'])}, missing={len(v_msg['missing'])}")
 
     lam_choices = [0.995]  # 例（あなたの実験に合わせて）
     target_choices = None

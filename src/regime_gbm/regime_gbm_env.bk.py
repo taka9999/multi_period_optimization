@@ -43,9 +43,7 @@ def _sample_regime_dict(reg: dict, rng: np.random.Generator, *,
 class RegimeGBMBandEnvMulti(GBMBandEnvMulti):
     """
     Regime-switching GBM.
-    We add "soft regime" gamma to obs via `self.gamma` if cfg.REGIME_GAMMA_ON_OBS is True.
-    - In simulation we know the true regime z_t, but to reduce train/test gap we output a noisy soft prob:
-        gamma = (1-eps)*onehot(z_t) + eps*(1/K)
+    Regime is (optionally) hidden: we do NOT add regime id to obs here.
     """
 
     def __init__(self, cfg, regimes, P=None, init_regime=None, R=None):
@@ -113,16 +111,6 @@ class RegimeGBMBandEnvMulti(GBMBandEnvMulti):
         self.regime_path = []
         self.regime = self._sample_initial_regime()
         self._apply_regime_params(self.regime)
-        self.gamma = self._regime_to_soft_gamma(self.regime)
-
-    def _regime_to_soft_gamma(self, k: int) -> np.ndarray:
-        K = int(self.K)
-        eps = float(getattr(self.cfg, "REGIME_OBS_EPS", 0.05))
-        eps = float(np.clip(eps, 0.0, 0.49))
-        g = np.full(K, eps / K, dtype=float)
-        kk = int(max(0, min(K - 1, int(k))))
-        g[kk] += (1.0 - eps)
-        return g
 
     def _sample_initial_regime(self):
         """Pick an initial regime.
@@ -184,7 +172,6 @@ class RegimeGBMBandEnvMulti(GBMBandEnvMulti):
         self.regime = self._sample_initial_regime()
         self.regime_path = [self.regime]
         self._apply_regime_params(self.regime)
-        self.gamma = self._regime_to_soft_gamma(self.regime)
         return super().reset(beta=self.beta, lam=lam, target_ret=target_ret, w0=w0)
 
     def step(self, A, B, use_trade_penalty=True):
@@ -194,7 +181,6 @@ class RegimeGBMBandEnvMulti(GBMBandEnvMulti):
 
         # apply new params
         self._apply_regime_params(self.regime)
-        self.gamma = self._regime_to_soft_gamma(self.regime)
 
         # usual step
         return super().step(A, B, use_trade_penalty=use_trade_penalty)

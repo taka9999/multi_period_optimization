@@ -143,6 +143,15 @@ def main():
         regimes, P = regimes_default, P_default
         print(f"[Regime] fallback to default regimes because: {e}")
 
+    # ============================================================
+    # Regime info into observation
+    #   - Env appends soft regime prob gamma (len K) to obs global features.
+    #   - Networks must be created with global_dim = 4 + K, and PPOConfig must match.
+    # ============================================================
+    K = int(len(regimes))
+    globalcfg.REGIME_GAMMA_ON_OBS = True
+    cfg.global_dim = 4 + K
+
     # env factory to inject into rollout
     #def env_ctor():
     #    return RegimeGBMBandEnvMulti(cfg=globalcfg, regimes=regimes, P=P, init_regime=None, R=R_base)
@@ -158,8 +167,15 @@ def main():
     # -------------------------
     # Networks / optim
     # -------------------------
-    policy = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True).to(globalcfg.device)
-    value  = ValueNetCLS(N, d_model=128, nlayers=2, nhead=4).to(globalcfg.device)
+    policy = JointBandPolicy(
+        N, d_model=128, nlayers=2, nhead=4,
+        use_cash_softmax=True,
+        global_dim=cfg.global_dim,
+    ).to(globalcfg.device)
+    value  = ValueNetCLS(
+        N, d_model=128, nlayers=2, nhead=4,
+        global_dim=cfg.global_dim,
+    ).to(globalcfg.device)
 
     opt_pi = optim.Adam(policy.parameters(), lr=cfg.lr_actor)
     opt_v  = optim.Adam(value.parameters(),  lr=cfg.lr_critic)
