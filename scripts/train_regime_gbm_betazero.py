@@ -56,6 +56,41 @@ def load_regime_json(path: str, *, N: int):
         raise ValueError(f"P shape mismatch: {P.shape}, expected KxK with K={len(regimes)}")
     return regimes, P, dt
 
+def _snapshot_trainable_params(model: torch.nn.Module):
+    # clone trainable params only
+    return {name: p.detach().clone()
+            for name, p in model.named_parameters()
+            if p.requires_grad}
+
+def _param_update_norm(prev, model: torch.nn.Module) -> float:
+    # L2 norm of (current - prev) over trainable params
+    sq = 0.0
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            d = (p.detach() - prev[name]).float()
+            sq += float((d*d).sum().cpu())
+    return float(np.sqrt(sq))
+
+@torch.no_grad()
+def sample_s_stats(policy, obs_batch: torch.Tensor) -> dict:
+    """
+    obs_batch: torch.Tensor [B, obs_dim] on device
+    Returns dict of s stats (using sample_s_only).
+    """
+    if hasattr(policy, "sample_s_only"):
+        s_t, _, _ = policy.sample_s_only(obs_batch)
+        s = s_t.detach().cpu().numpy()
+    else:
+        # fallback if you ever use older API
+        _, s_t, _, _, _ = policy.sample_stage2(obs_batch)
+        s = s_t.detach().cpu().numpy()
+    return {
+        "s_min": float(np.min(s)),
+        "s_mean": float(np.mean(s)),
+        "s_max": float(np.max(s)),
+        "s_std": float(np.std(s)),
+    }
+
 
 def main():
     # -------------------------
@@ -76,19 +111,17 @@ def main():
         INIT_W0_UNIFORM  = True,
         BAND_SMOOTH_COEF = 0.0,
         TRADE_PEN_COEF   = 0.0,
+        TARGET_ETA = 0.0,
         ALPHA = 1/3,
         STAGE1_WIDTH_COEF = 0.05,
 
-        REGIME_GAMMA_ON_OBS = False,
         OBS_BETA_ZERO = True,
-
-
     )
     # --- episode-level regime randomization ---
     # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.
     globalcfg.REGIME_EPISODE_RANDOMIZE = True
-    globalcfg.REGIME_BETA_STD = 0.25        # std for beta perturbation
-    globalcfg.REGIME_SIGMA_LOGSTD = 0.4    # log-std for sigma multiplicative noise
+    globalcfg.REGIME_BETA_STD = 0        # std for beta perturbation
+    globalcfg.REGIME_SIGMA_LOGSTD = 0.5    # log-std for sigma multiplicative noise
     globalcfg.REGIME_CORR_NOISE = 0.08      # additive noise on correlation matrix entries
     globalcfg.REGIME_BETA_CLIP = 0.999
     globalcfg.REGIME_SIGMA_CLIP = (1e-4, 10.0)
@@ -98,16 +131,16 @@ def main():
     R_base = build_corr_from_pairs(globalcfg.N_ASSETS, base_rho=0.20, pair_rhos=globalcfg.pair_rhos, make_psd=True)
     _ = build_cov(sigmas=globalcfg.sigmas, R=R_base, make_psd=True)
 
-    target_choices = [0.04, 0.06, 0.08, 0.1]
+    target_choices = [0.02, 0.04, 0.06, 0.08]
     REGIME_JSON = os.environ.get("REGIME_JSON", "configs/regime_k2_hist.json")
 
     cfg = PPOConfig(
         horizon=globalcfg.T_days,
         gamma=1.0,
         gae_lambda=1.0,
-        batch_episodes=32,
+        batch_episodes=64,
         epochs=4,
-        minibatch_size=4096,
+        minibatch_size=8192,
         lr_actor=1e-4,
         lr_critic=5e-4,
         lr_actor2=1e-4,
@@ -154,12 +187,9 @@ def main():
     #   - Env appends soft regime prob gamma (len K) to obs global features.
     #   - Networks must be created with global_dim = 4 + K, and PPOConfig must match.
     # ============================================================
-    if globalcfg.REGIME_GAMMA_ON_OBS:
-        K = int(len(regimes))
-        cfg.global_dim = 4 + K
-    else:
-        cfg.global_dim = 4
-
+    K = int(len(regimes))
+    globalcfg.REGIME_GAMMA_ON_OBS = True
+    cfg.global_dim = 4 + K
 
     # env factory to inject into rollout
     #def env_ctor():
@@ -198,8 +228,7 @@ def main():
     opt_pi = optim.Adam(filter(lambda p: p.requires_grad, policy.parameters()), lr=cfg.lr_actor)
 
     stages = [
-        ([0.90],  6, 32, 0.020),
-        ([0.95],  8, 32, 0.015),
+        ([0.975],  8, 32, 0.015),
         ([0.99,0.995], 10, 48, 0.012),
         ([0.995,0.999,1.0], 12, 48, 0.010),
     ]
@@ -213,14 +242,50 @@ def main():
                 policy, value, cfg,
                 gcfg=globalcfg,
                 lam_choices=lam_list,
-                target_choices=target_choices,
+                target_choices=None, #target_choices,
                 stage=2,
                 R=R_base,
                 env_ctor=env_ctor,     # ★ ここだけ追加
             )
-            ppo_update_joint(policy, value, opt_pi, opt_v, cfg, batch, env_cfg=globalcfg, stage=2, width_prior_w=0.02)
+            # ---- s statistics on the rollout batch obs (cheap) ----
+            obs = batch["obs"]  # [T_total, obs_dim] on device
+            B = min(obs.shape[0], 2048)
+            idx = torch.randint(0, obs.shape[0], (B,), device=obs.device)
+            s_stats = sample_s_stats(policy, obs[idx])
+
+            # ---- update-norm tracking ----
+            prev_params_epoch = _snapshot_trainable_params(policy)
+
+            ppo_update_joint(
+                policy, value, opt_pi, opt_v, cfg, batch,
+                env_cfg=globalcfg, stage=2, width_prior_w=0.02
+            )
+
+            upd_norm = _param_update_norm(prev_params_epoch, policy)
+
             if (it+1) % 2 == 0:
-                print(f"  upd {it+1:02d}: mean_annual_ret={batch['rew_ep_mean']/globalcfg.years:.4f}")
+                print(
+                    f"  upd {it+1:02d}: "
+                    f"mean_annual_ret={batch['rew_ep_mean']/globalcfg.years:.4f} "
+                    f"| upd_norm={upd_norm:.3e} "
+                    f"| s(min/mean/max/std)=({s_stats['s_min']:.3f}/{s_stats['s_mean']:.3f}/{s_stats['s_max']:.3f}/{s_stats['s_std']:.3f})"
+                )
+                print(
+                    f"... "
+                    f"| b(min/mean/max/zero%)=({batch.get('b_min_mean', float('nan')):.3e}/"
+                    f"{batch.get('b_mean_mean', float('nan')):.3e}/"
+                    f"{batch.get('b_max_mean', float('nan')):.3e}/"
+                    f"{100*batch.get('b_zero_frac_mean', float('nan')):.1f}%) "
+                    f"| trade_rate={batch.get('trade_rate_mean', float('nan')):.3f} "
+                    f"| avg_turnover={batch.get('avg_turnover_mean', float('nan')):.3e}"
+                    )
+                print(f"... | minm_zero={batch.get('minm_zero_mean', float('nan')):.3f}"
+                    f" delta_zero={batch.get('delta_zero_mean', float('nan')):.3f}"
+                    f" s_zero={batch.get('s_zero_mean', float('nan')):.3f}"
+                    f" b_zero={batch.get('b_zero_mean', float('nan')):.3f}"
+                    )
+
+
 
     # -------------------------
     # Save
@@ -228,8 +293,8 @@ def main():
     outdir = "checkpoints_regime_A2"
     os.makedirs(outdir, exist_ok=True)
 
-    torch.save(policy.state_dict(), os.path.join(outdir, "policy_stage2_A2_minvar.pt"))
-    torch.save(value.state_dict(),  os.path.join(outdir, "value_stage2_A2_minvar.pt"))
+    torch.save(policy.state_dict(), os.path.join(outdir, "policy_stage2_A2_regime_beta_zero.pt"))
+    torch.save(value.state_dict(),  os.path.join(outdir, "value_stage2_A2_regime_beta_zero.pt"))
     meta = dict(
         N_ASSETS=N,
         target_choices=target_choices,

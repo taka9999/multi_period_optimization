@@ -14,32 +14,35 @@ class globalsetting:
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
 
     N_ASSETS: int = 5
-    years: float = 5
+    years: float = 1
     dt_day: float = 1/252
     T_days: int = int(years/dt_day)
     r: float = 0.02
     sigmas: np.ndarray = field(default_factory=lambda: np.array([0.20, 0.18, 0.12, 0.22, 0.19], dtype=float))
     pair_rhos: dict = field(default_factory=lambda: {
-    (0,1): 0.60,   # US Eq と ex-US Eq を高相関
-    (1,3): -0.20,  # ex-US Eq と EM Eq をやや逆相関に
-    (2,4): 0.05,   # HY と SmallCap をほぼ無相関に近づける
+    (0,1): 0.60,
+    (1,3): -0.20,
+    (2,4): 0.05,
     })
 
     DISCOUNT_BY_BANK: bool = True
     INIT_W0_UNIFORM: bool = True
     BAND_SMOOTH_COEF: float = 0.0
     TRADE_PEN_COEF: float = 0.0
-    ALPHA: float = 1/5
+    ALPHA: float = 1/3
     STAGE1_WIDTH_COEF: float = 0.05
 
     # LQ / MV-style reward parameters
-    RISK_GAMMA: float = 1.0        # gamma in (1/2)*gamma*w^T Sigma w
-    TARGET_ETA: float = 5.0        # eta in hinge penalty eta*[target - mu^T w]_+
-    TARGET_RET_ANN: float = 0.05   # default annual target (discounted-by-bank world)
-        # --- regime obs (gamma) ---
+    ALLOW_CASH_IN_MV: bool = False
+    MV_USE_TARGET: bool = False   # whether to use target return constraint in MV center
+    RISK_GAMMA: float = 0.0
+    TARGET_ETA: float = 0.0        # eta in hinge penalty eta*[target - mu^T w]_+
+    TARGET_RET_ANN: float = 0.06   # default annual target (discounted-by-bank world)
+    # --- regime obs (gamma) ---
     # base global feats are [lam, target_ret_dt, port_var, ||R w||] = 4 dims
     # if env provides self.gamma (len K), obs global dims become 4+K
-    REGIME_GAMMA_ON_OBS: bool = True
+    REGIME_GAMMA_ON_OBS: bool = False
+    OBS_BETA_ZERO: bool = True
 
 
 def reflect_multi(S: np.ndarray,
@@ -124,7 +127,189 @@ def reflect_multi(S: np.ndarray,
     #print("max A-gap", np.max(A - w_after), "max B-viol", np.max(w_after - B), "cash", C)
     return S, C, sold_total
 
-def project_rotated_box_qp(
+def buy_to_target_free(S, C, w_tgt, *, max_iter=10):
+    """
+    Buy towards w_tgt using available cash (no transaction cost).
+    """
+    S = S.copy()
+    C = float(C)
+
+    for _ in range(max_iter):
+        Y = S.sum() + C
+        if Y <= 0 or C <= 1e-12:
+            break
+        w = S / (Y + 1e-30)
+        gap = np.maximum(0.0, w_tgt - w)
+        need = gap * Y
+        tot_need = need.sum()
+        if tot_need <= 1e-12:
+            break
+        spend = min(C, tot_need)
+        buy = need / (tot_need + 1e-30) * spend
+        S += buy
+        C -= float(buy.sum())
+
+    return S, C
+
+
+def project_axis_box_qp(
+    w: np.ndarray,
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    allow_cash: bool,
+    solver: str = "OSQP",
+) -> np.ndarray:
+    """
+    Euclidean projection:
+        minimize 0.5||u - w||^2
+        s.t. 0 <= u
+             A <= u <= B
+             sum(u) <= 1 (allow_cash) or == 1 (no cash)
+    """
+    w = np.asarray(w, float).reshape(-1)
+    A = np.asarray(A, float).reshape(-1)
+    B = np.asarray(B, float).reshape(-1)
+    n = w.size
+
+    u = cp.Variable(n)
+    cons = [
+        u >= 0,
+        u >= A,
+        u <= B,
+    ]
+    cons += [cp.sum(u) <= 1.0] if allow_cash else [cp.sum(u) == 1.0]
+
+    obj = cp.Minimize(0.5 * cp.sum_squares(u - w))
+    prob = cp.Problem(obj, cons)
+
+    try:
+        prob.solve(solver=getattr(cp, solver), warm_start=True, verbose=False)
+    except Exception:
+        prob.solve(solver=cp.SCS, warm_start=True, verbose=False)
+
+    if u.value is None:
+        # fallback: simple clip (still respects box; sum constraint may violate a bit)
+        out = np.clip(w, A, B)
+    else:
+        out = np.asarray(u.value, float).reshape(-1)
+
+    # numeric safety
+    out = np.clip(out, 0.0, 1.0)
+    s = float(out.sum())
+    if allow_cash:
+        if s > 1.0 + 1e-10:
+            out /= max(s, 1e-12)
+    else:
+        if s > 1e-12:
+            out /= s
+    return out
+
+# =====================================================
+# Rotated-box projection QP cache + auto rebuild
+# =====================================================
+_ROTBOX_PROB_CACHE = {}
+
+def _dense_nozeros(U: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Force a dense-ish matrix to keep OSQP nnz pattern stable across updates."""
+    U = np.asarray(U, float)
+    U2 = U.copy()
+    U2[np.abs(U2) < eps] = eps
+    return U2
+
+class _RotBoxQP:
+    def __init__(self, n: int, allow_cash: bool):
+        import cvxpy as cp
+        self.cp = cp
+        self.n = int(n)
+        self.allow_cash = bool(allow_cash)
+
+        self.u = cp.Variable(self.n)
+
+        # Parameters
+        self.w  = cp.Parameter(self.n)
+        self.m  = cp.Parameter(self.n)
+        self.U  = cp.Parameter((self.n, self.n))
+        self.bz = cp.Parameter(self.n, nonneg=True)
+
+        z = self.U.T @ (self.u - self.m)
+        cons = [self.u >= 0, z <= self.bz, z >= -self.bz]
+        cons += [cp.sum(self.u) <= 1.0] if self.allow_cash else [cp.sum(self.u) == 1.0]
+
+        obj = cp.Minimize(0.5 * cp.sum_squares(self.u - self.w))
+        self.prob = cp.Problem(obj, cons)
+
+    def solve_osqp(self, w, m, U, bz, *, warm_start: bool, eps_abs=1e-5, eps_rel=1e-5, max_iter=20000):
+        cp = self.cp
+        self.w.value  = np.asarray(w, float).reshape(-1)
+        self.m.value  = np.asarray(m, float).reshape(-1)
+        self.U.value  = _dense_nozeros(U)                 # ★ nnz 安定化
+        self.bz.value = np.asarray(bz, float).reshape(-1)
+
+        self.prob.solve(
+            solver=cp.OSQP,
+            warm_start=bool(warm_start),
+            verbose=False,
+            eps_abs=float(eps_abs),
+            eps_rel=float(eps_rel),
+            max_iter=int(max_iter),
+            polish=False,
+        )
+        return self.prob.status, self.u.value
+
+    def solve_scs(self, w, m, U, bz):
+        cp = self.cp
+        self.w.value  = np.asarray(w, float).reshape(-1)
+        self.m.value  = np.asarray(m, float).reshape(-1)
+        self.U.value  = _dense_nozeros(U)
+        self.bz.value = np.asarray(bz, float).reshape(-1)
+
+        self.prob.solve(solver=cp.SCS, warm_start=True, verbose=False)
+        return self.prob.status, self.u.value
+
+
+def _get_rotbox_qp(n: int, *, allow_cash: bool) -> _RotBoxQP:
+    key = (int(n), bool(allow_cash))
+    qp = _ROTBOX_PROB_CACHE.get(key)
+    if qp is None:
+        qp = _RotBoxQP(n, allow_cash)
+        _ROTBOX_PROB_CACHE[key] = qp
+    return qp
+
+
+def _rebuild_rotbox_qp(n: int, *, allow_cash: bool) -> _RotBoxQP:
+    key = (int(n), bool(allow_cash))
+    qp = _RotBoxQP(n, allow_cash)
+    _ROTBOX_PROB_CACHE[key] = qp
+    return qp
+
+# ----------------------------
+# Rotated-box QP stats (minimal)
+# ----------------------------
+_ROTBOX_QP_STATS = {
+    "step_calls": 0,        # step_rotated_box 呼び出し回数
+    "inside": 0,            # inside-band 回数（QP未実行）
+    "outside": 0,           # outside-band 回数（QP実行）
+    "qp_calls": 0,          # project_rotated_box_qp 呼び出し回数（= outside）
+    "cached_ok": 0,         # 1) cached solve で _ok
+    "rebuild": 0,           # 2) auto rebuild 実行回数
+    "rebuild_ok": 0,        # rebuild 後に _ok
+    "fallback_scs": 0,      # 3) hard fallback to SCS 実行回数
+    "opt_inacc": 0,         # status に optimal_inaccurate が含まれた回数
+    "fail": 0,              # val is None で w を返した回数
+}
+
+def _rotbox_stats_line(prefix: str = "[RotBoxQP]") -> str:
+    s = _ROTBOX_QP_STATS
+    return (
+        f"{prefix} step={s['step_calls']} inside={s['inside']} outside={s['outside']} | "
+        f"qp_calls={s['qp_calls']} cached_ok={s['cached_ok']} rebuild={s['rebuild']} "
+        f"rebuild_ok={s['rebuild_ok']} fallback_scs={s['fallback_scs']} "
+        f"opt_inacc={s['opt_inacc']} fail={s['fail']}"
+    )
+
+
+def project_rotated_box_qp_old(
     w: np.ndarray,
     m: np.ndarray,
     U: np.ndarray,
@@ -179,6 +364,103 @@ def project_rotated_box_qp(
     else:
         if s > 1e-12:
             out /= s
+    return out
+
+def project_rotated_box_qp(
+    w: np.ndarray,
+    m: np.ndarray,
+    U: np.ndarray,
+    b_z: np.ndarray,
+    *,
+    allow_cash: bool = True,
+    solver: str = "SCS",
+) -> np.ndarray:
+    """
+    Projection of w onto rotated box:
+        |U^T (u - m)| <= b_z, u>=0, sum(u)<=1 (cash) or ==1 (no cash)
+
+    Cached CVXPY Problem (via _RotBoxQP) + auto rebuild.
+    """
+
+    w = np.asarray(w, float).reshape(-1)
+    m = np.asarray(m, float).reshape(-1)
+    U = np.asarray(U, float)
+    b_z = np.asarray(b_z, float).reshape(-1)
+    n = w.size
+
+    qp = _get_rotbox_qp(n, allow_cash=allow_cash)
+    _ROTBOX_QP_STATS["qp_calls"] += 1
+
+    def _ok(status: str, val) -> bool:
+        if val is None or status is None:
+            return False
+        s = str(status).lower()
+        # SCS: "optimal" / "optimal_inaccurate" があり得る（まずは許容）
+        if str(solver).upper() == "SCS":
+            return ("optimal" in s)  # optimal / optimal_inaccurate OK
+        # OSQP: strict にするなら == "optimal" のみ
+        return (s == "optimal")
+
+    status = None
+    val = None
+
+    s = str(solver).upper()
+
+    # ---- 1) cached solve ----
+    try:
+        if s == "SCS":
+            status, val = qp.solve_scs(w, m, U, b_z)
+        else:
+            status, val = qp.solve_osqp(w, m, U, b_z, warm_start=True)
+    except Exception:
+        status, val = None, None
+
+    if status is not None and ("optimal_inaccurate" in str(status).lower()):
+        _ROTBOX_QP_STATS["opt_inacc"] += 1
+    if _ok(status, val):
+        _ROTBOX_QP_STATS["cached_ok"] += 1
+
+    # ---- 2) auto rebuild + retry ----
+    if not _ok(status, val):
+        _ROTBOX_QP_STATS["rebuild"] += 1
+        qp = _rebuild_rotbox_qp(n, allow_cash=allow_cash)
+        try:
+            if s == "SCS":
+                status, val = qp.solve_scs(w, m, U, b_z)
+            else:
+                status, val = qp.solve_osqp(w, m, U, b_z, warm_start=False)
+        except Exception:
+            status, val = None, None
+        
+        if status is not None and ("optimal_inaccurate" in str(status).lower()):
+            _ROTBOX_QP_STATS["opt_inacc"] += 1
+        if _ok(status, val):
+            _ROTBOX_QP_STATS["rebuild_ok"] += 1
+
+    # ---- 3) hard fallback to SCS ----
+    if not _ok(status, val):
+        _ROTBOX_QP_STATS["fallback_scs"] += 1
+        try:
+            status, val = qp.solve_scs(w, m, U, b_z)
+        except Exception:
+            val = None
+        if status is not None and ("optimal_inaccurate" in str(status).lower()):
+            _ROTBOX_QP_STATS["opt_inacc"] += 1
+
+    if val is None:
+        _ROTBOX_QP_STATS["fail"] += 1
+        return w.copy()
+
+    out = np.asarray(val, float).reshape(-1)
+    out = clamp01_vec(out)
+
+    ss = float(out.sum())
+    if allow_cash:
+        if ss > 1.0 + 1e-10:
+            out /= max(ss, 1e-12)
+    else:
+        if ss > 1e-12:
+            out /= ss
     return out
 
 def trade_to_target_sellonly(
@@ -240,7 +522,6 @@ def trade_to_target_sellonly(
 
     return S, float(C), sold_total
 
-
 # ----------------------------
 # Environment (Multi-asset)
 # ----------------------------
@@ -256,6 +537,7 @@ class GBMBandEnvMulti:
         self.discount_by_bank = self.cfg.DISCOUNT_BY_BANK
         self.bank_growth = 1.0 if self.discount_by_bank else math.exp(self.r*self.dt)
         self.rng = np.random.default_rng(self.cfg.seed)
+        self.allow_cash = self.cfg.ALLOW_CASH_IN_MV
         
         self.sigmas = np.asarray(self.cfg.sigmas, float)
         N = len(self.sigmas)
@@ -302,7 +584,11 @@ class GBMBandEnvMulti:
         self.Z_path = None if Z is None else np.asarray(Z, float)
         self.z_ptr = 0
         # annual target return (discounted-by-bank). If None, use cfg default
-        self.target_ret_ann = float(self.cfg.TARGET_RET_ANN if target_ret is None else target_ret)
+        if target_ret is None and float(getattr(self.cfg, "TARGET_ETA", 0.0)) == 0.0:
+            self.target_ret_ann = 0.0
+        else:
+            self.target_ret_ann = float(self.cfg.TARGET_RET_ANN if target_ret is None else target_ret)
+        #self.target_ret_ann = float(self.cfg.TARGET_RET_ANN if target_ret is None else target_ret)
         self.target_ret_dt  = self.target_ret_ann * self.dt
         self.t = 0
         self.A_prev = None; self.B_prev = None
@@ -332,7 +618,13 @@ class GBMBandEnvMulti:
         lam_scalar = float(self.lam.mean()) if isinstance(self.lam, np.ndarray) else float(self.lam)
         Y = self.S.sum() + self.C
         w = self.S / (Y + 1e-30)                       # [N]
-        beta = self.beta                                # [N]
+        beta = self.beta
+        # If you want to randomize beta for data-generation but NOT expose it to the policy,
+        # #set cfg.OBS_BETA_ZERO = True.
+        if bool(getattr(self.cfg, "OBS_BETA_ZERO", False)):
+            beta = np.zeros_like(self.beta)
+        else:
+            beta = self.beta
         sigma = self.sigmas                             # [N]
         Rw = self.R @ w                                 # [N]
 
@@ -370,7 +662,37 @@ class GBMBandEnvMulti:
 
         # reflect
         Y_prev = self.S.sum() + self.C
-        self.S, self.C, sold_total = reflect_multi(self.S, self.C, A, B, self.lam)
+        w_pre = (self.S / (Y_prev + 1e-30)).copy()
+        #self.S, self.C, sold_total = reflect_multi(self.S, self.C, A, B, self.lam)
+        inside = bool(np.all(w_pre >= A - 1e-12) and np.all(w_pre <= B + 1e-12))
+
+        sold_total = 0.0
+        if not inside:
+            # 1) QP target inside [A,B] + simplex/cash constraint
+            w_tgt = project_axis_box_qp(
+                w_pre, A, B,
+                allow_cash=bool(self.allow_cash),
+                solver="OSQP",
+            )
+
+            # 2) execute sell-only trades toward that target
+            self.S, self.C, sold_total = trade_to_target_sellonly(
+                self.S, self.C, w_tgt, self.lam
+            )
+        
+        #if not inside:
+        #    # after trade:
+        #    w_after = self.S / (self.S.sum() + self.C + 1e-30)
+        #    print("[A2QPtrade] tgt_gap=",
+        #          float(np.max(np.maximum(w_tgt - B, A - w_tgt))),
+        #          "after_gap=",
+        #          float(np.max(np.maximum(w_after - B, A - w_after))),
+        #          "cash=", float(self.C))
+
+
+        Y_mid0 = self.S.sum() + self.C
+        self.w_post_trade = self.S / (Y_mid0 + 1e-30)
+        self.sold_total_last = float(sold_total)   # optional
 
         # GBM step (vector)
         z = self._draw_z()
@@ -393,38 +715,32 @@ class GBMBandEnvMulti:
         # discounted-by-bank simple return over dt (diagnostic + main reward component)
         r_simple = (Y_next / max(Y_prev, 1e-30)) - 1.0
 
-        # ----- MV / LQ-style shaping (model-based risk + target constraint) -----
-        # Evaluate using *held* weights for this step (after reflection / trading).
+                # realized log return for training reward
+        gross = Y_next / max(Y_prev, 1e-30)
+        r_log = np.log(max(gross, 1e-30))
+
+        # MV/LQ shaping (same)
         Y_mid = self.S.sum() + self.C
         w_mid = self.S / (Y_mid + 1e-30)
 
-        # Model-implied drift used in the GBM step
         mu = self.r + (self.sigmas**2) * self.beta
         mu_eff = mu - self.r if self.discount_by_bank else mu
 
-        # Per-step expected return and variance (small-dt approximation)
         mu_w_dt  = float(mu_eff @ w_mid) * self.dt
         var_w_dt = float(w_mid @ self.Cov @ w_mid) * self.dt
 
-        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 1.0))
         eta_target = float(getattr(self.cfg, "TARGET_ETA", 0.0))
-
-        # hinge penalty: only punish *below target* in expected-return space
         shortfall = max(0.0, float(self.target_ret_dt) - mu_w_dt)
 
-        # reward: r_simple - (gamma/2)*Var_dt - eta*shortfall
-        u_mv = r_simple - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
+        # additional risk penalty
+        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 0.0))
 
-        # total step reward
-        r_step = u_mv - band_pen - trade_pen
-
-        # keep r_simple as diagnostic
-        lret = r_simple  # returned as diagnostic
+        u = r_log - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
+        r_step = u - trade_pen
 
         self.A_prev, self.B_prev = A.copy(), B.copy()
-
         obs = self._make_obs()
-        return obs, float(r_step), done, float(lret)
+        return obs, float(r_step), done, float(r_simple)
     
     def step_rotated_box(
         self,
@@ -433,15 +749,19 @@ class GBMBandEnvMulti:
         b_z: np.ndarray,
         *,
         allow_cash: bool = True,
-        solver: str = "OSQP",
-        use_trade_penalty: bool = True,
+        solver: str = "SCS",
+        use_trade_penalty: bool = False,
         ):
         """
         Level B evaluation step with inside-band no-trade shortcut
         """
+        EPS_IN = float(getattr(self.cfg, "ROTBOX_EPS_IN", 1e-6))
 
         m = np.asarray(m, float).reshape(-1)
         b_z = np.asarray(b_z, float).reshape(-1)
+        BZ_FLOOR = float(getattr(self.cfg, "ROTBOX_BZ_FLOOR", 1e-6))
+        b_z = np.maximum(b_z, BZ_FLOOR)
+
         U = np.asarray(U, float)
         N = self.cfg.N_ASSETS
         assert m.size == N and b_z.size == N and U.shape == (N, N)
@@ -453,7 +773,21 @@ class GBMBandEnvMulti:
         # (A) inside-band check in rotated coordinates
         # ======================================================
         z = U.T @ (w - m)
-        inside = np.all(np.abs(z) <= b_z + 1e-12)
+        inside = np.all(np.abs(z) <= b_z + EPS_IN)
+        _ROTBOX_QP_STATS["step_calls"] += 1
+        if inside:
+            _ROTBOX_QP_STATS["inside"] += 1
+        else:
+            _ROTBOX_QP_STATS["outside"] += 1
+        
+        margin = float(np.max(np.abs(z) - (b_z + EPS_IN)))   # <=0 なら inside
+
+        #if (self.t % 10000) == 0:
+        #    print(f"[RotBoxQP] margin_max={margin:+.3e} | "
+        #        f"absz_max={float(np.max(np.abs(z))):.3e} | "
+        #        f"bz_min/med/max=({float(np.min(b_z)):.3e}/"
+        #        f"{float(np.median(b_z)):.3e}/"
+        #        f"{float(np.max(b_z)):.3e})")
 
         sold_total = 0.0
 
@@ -466,11 +800,45 @@ class GBMBandEnvMulti:
                 allow_cash=allow_cash,
                 solver=solver
             )
+            z_proj = U.T @ (w_proj - m)
+            inside_proj = np.all(np.abs(z_proj) <= b_z + EPS_IN)
+            #if (self.t % 10000) == 0:
+            #    print(f"[RotBoxQP] inside_proj={inside_proj} | "
+            #        f"margin_proj={float(np.max(np.abs(z_proj)-(b_z + EPS_IN))):+.3e}")
+
+            # execute sell-only trades toward that target
             self.S, self.C, sold_total = trade_to_target_sellonly(
                 self.S, self.C, w_proj, self.lam
             )
-        # else:
-        #   INSIDE band → no trade, keep S,C as is
+            # (3) BUY free up to target (cash constrained, same as A2)
+            self.S, self.C = buy_to_target_free(
+                self.S, self.C, w_proj
+            )
+
+            # optional debug: after trade
+            # Y_mid = float(self.S.sum() + self.C)
+            # w_after = self.S / (Y_mid + 1e-30)
+            # z_after = U.T @ (w_after - m)
+            # inside_after = np.all(np.abs(z_after) <= b_z + EPS_IN)
+
+        # --- after check (tradeした場合も、しない場合も) ---
+        Y_mid2 = float(self.S.sum() + self.C)
+        w_after = self.S / (Y_mid2 + 1e-30)
+        z_after = U.T @ (w_after - m)
+        inside_after = np.all(np.abs(z_after) <= b_z + EPS_IN)
+        margin_after = float(np.max(np.abs(z_after) - (b_z + EPS_IN)))
+
+        #if (self.t % 10000) == 0:
+        #    print(f"[RotBoxQP] inside_before={inside} inside_after={inside_after} "
+        #        f"| margin_after={margin_after:+.3e}")
+
+        #if (self.t % 10000) == 0:
+        #    print(_rotbox_stats_line())
+
+        #if (self.t % 10000) == 0:
+        #    print(f"[RotBoxQP] eps_in={EPS_IN:.1e} bz_floor={BZ_FLOOR:.1e} "
+        #        f"| bz_min/med/max=({b_z.min():.3e}/{np.median(b_z):.3e}/{b_z.max():.3e})")
+    
 
         # ======================================================
         # (C) GBM evolution (same as before)
@@ -505,18 +873,28 @@ class GBMBandEnvMulti:
         # ======================================================
         r_simple = (Y_next / max(Y_prev, 1e-30)) - 1.0
 
+                # realized log return for training reward
+        gross = Y_next / max(Y_prev, 1e-30)
+        r_log = np.log(max(gross, 1e-30))
+
+        # MV/LQ shaping (same)
         Y_mid = self.S.sum() + self.C
         w_mid = self.S / (Y_mid + 1e-30)
+
+        mu = self.r + (self.sigmas**2) * self.beta
+        mu_eff = mu - self.r if self.discount_by_bank else mu
 
         mu_w_dt  = float(mu_eff @ w_mid) * self.dt
         var_w_dt = float(w_mid @ self.Cov @ w_mid) * self.dt
 
-        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 1.0))
         eta_target = float(getattr(self.cfg, "TARGET_ETA", 0.0))
         shortfall = max(0.0, float(self.target_ret_dt) - mu_w_dt)
 
-        u_mv = r_simple - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
-        r_step = u_mv - trade_pen
+        # additional risk penalty
+        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 0.0))
+
+        u = r_log - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
+        r_step = u - trade_pen
 
         obs = self._make_obs()
         return obs, float(r_step), done, float(r_simple)
@@ -529,7 +907,7 @@ class GBMBandEnvMulti:
             *,
             allow_cash: bool = True,
             solver: str = "OSQP",
-            use_trade_penalty: bool = True,
+            use_trade_penalty: bool = False,
             ):
         """
         Level B evaluation step:
@@ -560,8 +938,12 @@ class GBMBandEnvMulti:
             lam_scalar = float(self.lam.mean()) if isinstance(self.lam, np.ndarray) else float(self.lam)
             trade_pen = self.cfg.TRADE_PEN_COEF * (1.0 - lam_scalar) * float(sold_total / max(Y_prev, 1e-30))
 
-        # diagnostic return
+        # diagnostic return (keep simple)
         r_simple = (Y_next / max(Y_prev, 1e-30)) - 1.0
+
+        # realized log return for training reward
+        gross = Y_next / max(Y_prev, 1e-30)
+        r_log = np.log(max(gross, 1e-30))
 
         # MV/LQ shaping (same)
         Y_mid = self.S.sum() + self.C
@@ -573,12 +955,14 @@ class GBMBandEnvMulti:
         mu_w_dt  = float(mu_eff @ w_mid) * self.dt
         var_w_dt = float(w_mid @ self.Cov @ w_mid) * self.dt
 
-        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 1.0))
         eta_target = float(getattr(self.cfg, "TARGET_ETA", 0.0))
         shortfall = max(0.0, float(self.target_ret_dt) - mu_w_dt)
 
-        u_mv = r_simple - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
-        r_step = u_mv - trade_pen
+        # additional risk penalty
+        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 0.0))
+
+        u = r_log - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
+        r_step = u - trade_pen
 
         obs = self._make_obs()
         return obs, float(r_step), done, float(r_simple)

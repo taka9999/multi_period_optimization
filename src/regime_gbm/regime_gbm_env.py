@@ -162,6 +162,7 @@ class RegimeGBMBandEnvMulti(GBMBandEnvMulti):
         w = np.maximum(w, eps)
         self.R = (V * w) @ V.T
         self.Cov = np.diag(self.sigmas) @ self.R @ np.diag(self.sigmas)
+        self.ChR = np.linalg.cholesky(self.R)
 
     def reset(self, beta=None, lam=None, target_ret=None, w0=None):
         # episode-level regime parameter randomization (optional)

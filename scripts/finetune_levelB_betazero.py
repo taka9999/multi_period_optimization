@@ -144,19 +144,26 @@ def make_fixed_eval_cases(
     beta_low=-0.95, beta_high=0.95,
     lam_choices=(0.99, 0.995),
     frac_choices=(0.3, 0.5, 0.7),
+    gcfg: globalsetting,
 ):
     sig2 = np.asarray(sigmas, float)**2
     cases = []
     for k in range(n_cases):
         seed = base_seed + k
         rng = np.random.default_rng(seed)
-        beta = rng.uniform(beta_low, beta_high, size=len(sig2))
+        if gcfg.FORCE_BETA_ZERO:
+            beta = np.zeros(len(sig2), dtype=float)
+        else:
+            beta = rng.uniform(beta_low, beta_high, size=len(sig2))
         lam  = float(rng.choice(lam_choices))
 
         mu_eff = sig2 * beta
         mu_max = float(mu_eff.max())
         frac   = float(rng.choice(frac_choices))
-        target = max(0.0, frac * mu_max)  # reachable by construction
+        if gcfg.FORCE_BETA_ZERO:
+            target = None
+        else:
+            target = max(0.0, frac * mu_max)  # reachable by construction
 
         cases.append((seed, beta, lam, target))
     return cases
@@ -286,59 +293,6 @@ def save_checkpoint(
     }
     torch.save(payload, p / f"ft_epoch{epoch:03d}.pt")
 
-def mv_weights_target_return(
-    Cov, mu_eff, target_ann,
-    allow_cash=True,
-    solver="OSQP",
-    infeasible_policy="fallback",  # "skip" or "fallback"
-):
-    """
-    min w^T Cov w
-    s.t. mu_eff^T w >= target_ann, w>=0, sum(w)<=1 (cash allowed)
-
-    infeasible_policy:
-      - "skip": return None if target_ann > max(mu_eff) (not achievable under long-only+cash)
-      - "fallback": invest 100% in argmax(mu_eff)
-    """
-    mu_eff = np.asarray(mu_eff, float)
-    n = len(mu_eff)
-    mu_max = float(mu_eff.max())
-
-    if target_ann > mu_max + 1e-12:
-        if infeasible_policy == "skip":
-            return None
-        else:
-            ww = np.zeros(n)
-            ww[int(np.argmax(mu_eff))] = 1.0
-            return ww
-
-    w = cp.Variable(n)
-    obj = cp.Minimize(cp.quad_form(w, Cov))
-    cons = [w >= 0, mu_eff @ w >= float(target_ann)]
-    cons += [cp.sum(w) <= 1.0] if allow_cash else [cp.sum(w) == 1.0]
-    prob = cp.Problem(obj, cons)
-
-    try:
-        prob.solve(solver=getattr(cp, solver), verbose=False)
-    except Exception:
-        prob.solve(solver=cp.SCS, verbose=False)
-
-    if w.value is None:
-        if infeasible_policy == "skip":
-            return None
-        ww = np.zeros(n)
-        ww[int(np.argmax(mu_eff))] = 1.0
-        return ww
-
-    ww = np.maximum(0.0, np.array(w.value).reshape(-1))
-    s = float(ww.sum())
-    if not allow_cash:
-        ww /= (s + 1e-12)
-    else:
-        if s > 1.0:
-            ww /= (s + 1e-12)
-    return ww
-
 def compute_levelB_basis_and_width(m_star, Cov, gamma, lam_scalar, eps=1e-12, scale=1.0):
     """
     Returns (U, delta_z) where:
@@ -357,113 +311,12 @@ def compute_levelB_basis_and_width(m_star, Cov, gamma, lam_scalar, eps=1e-12, sc
     eigvals = np.maximum(eigvals, 0.0)
 
     Cov_rot = U.T @ Cov @ U
-    gamma_eff = 1 + float(gamma)
-    Gamma_kk = np.maximum(eps, float(gamma_eff) * np.maximum(eps, np.diag(Cov_rot)))
+    Gamma_kk = np.maximum(eps, float(gamma) * np.maximum(eps, np.diag(Cov_rot)))
 
     delta_z = scale * np.power((kappa * eigvals) / Gamma_kk, 1.0/3.0)
     delta_z = np.maximum(delta_z, 0.0)
     return U, delta_z
 
-def run_episode_RL_band_levelB_v2(env_cfg, R, policy, beta, lam_cost, target_ann, seed=2025, T=None, device="cpu",
-                               infeasible_policy="skip", mv_solver="OSQP", qp_solver="OSQP",
-                               mv_allow_cash=False, force_s_one: bool = False, return_step :bool = True):
-    """
-    Level B executor evaluation:
-      - compute MV center m_star (same as A2)
-      - build rotated basis U and z-width prior delta_z (once per episode)
-      - per step: get s (or force s≡1), set b_z = 0.95*s*delta_z, then env.step_rotated_box(...)
-    Returns: rsimple array or None if infeasible
-    """
-    cfg2 = env_cfg
-    cfg2.seed = int(seed)
-
-    env = GBMBandEnvMulti(cfg=cfg2, R=R)
-    N = cfg2.N_ASSETS
-    w0 = np.full(N, 1.0 / N) * 0.8
-    obs = env.reset(beta=beta, lam=lam_cost, target_ret=target_ann, w0=w0)
-
-    target_ann_eff = float(env.target_ret_ann)
-    mu_eff = (cfg2.sigmas**2) * beta
-    m_star = mv_weights_target_return(env.Cov, mu_eff, target_ann_eff, allow_cash=mv_allow_cash,
-                                      solver=mv_solver, infeasible_policy=infeasible_policy)
-    if m_star is None:
-        return None
-
-    T = env.T if T is None else int(T)
-    rsimple = []
-    rstep = []
-
-    lam_scalar = float(env.lam.mean()) if isinstance(env.lam, np.ndarray) else float(env.lam)
-    U, delta_z = compute_levelB_basis_and_width(
-        m_star=m_star,
-        Cov=env.Cov,
-        gamma=float(getattr(cfg2, "RISK_GAMMA", 1.0)),
-        lam_scalar=lam_scalar,
-        scale=1.0,
-    )
-
-    for _ in range(T):
-        o = np.array(obs, dtype=np.float32)
-
-        # get s from policy (same as A2), or force s≡1
-        if force_s_one:
-            s = np.ones(N, dtype=float)
-        else:
-            with torch.no_grad():
-                if hasattr(policy, "sample_s_only"):
-                    s_t, _, _ = policy.sample_s_only(torch.tensor(o, device=device).unsqueeze(0))
-                    s = s_t.squeeze(0).detach().cpu().numpy()
-                else:
-                    _, s_t, _, _, _ = policy.sample_stage2(torch.tensor(o, device=device).unsqueeze(0))
-                    s = s_t.squeeze(0).detach().cpu().numpy()
-
-        b_z = 0.95 * s * delta_z
-
-        obs, r_step, done, r_simple = env.step_rotated_box(
-            m=m_star, U=U, b_z=b_z,
-            allow_cash=mv_allow_cash,
-            solver=qp_solver,
-            use_trade_penalty=True
-        )
-        rsimple.append(float(r_simple))
-        rstep.append(float(r_step))
-        if done:
-            break
-    if return_step:
-        return np.array(rsimple), np.array(rstep)
-    else:
-        return np.array(rsimple)
-
-def eval_levelB_fixed_cases(
-    gcfg, R, policy, cases, *, device, mv_solver="OSQP", qp_solver="OSQP",
-    infeasible_policy="fallback", mv_allow_cash=False, force_s_one=False,
-):
-    rews = []
-    lrets = []
-    T_days = gcfg.T_days
-    for (seed, beta, lam, target_ann) in cases:
-        rs, rsteps = run_episode_RL_band_levelB_v2(
-            gcfg, R, policy, beta, lam, target_ann,
-            seed=seed, T=T_days, device=device,
-            infeasible_policy=infeasible_policy, mv_solver=mv_solver,
-            qp_solver=qp_solver, mv_allow_cash=mv_allow_cash,
-            force_s_one=force_s_one,
-            return_step=True,
-        )
-        if rs is None:
-            continue
-        # ここはあなたの定義に合わせて（例：logret の合計など）でOK
-        rews.append(float(np.sum(rsteps)))              # 例：簡易
-        lrets.append(float(np.sum(np.log1p(rs))))   # 例：簡易
-
-    out = {
-        "n_ok": len(rews),
-        "rew_ep_mean": float(np.mean(rews)) if rews else np.nan,
-        "rew_ep_std":  float(np.std(rews))  if rews else np.nan,
-        "lret_ep_mean": float(np.mean(lrets)) if lrets else np.nan,
-        "lret_ep_std":  float(np.std(lrets))  if lrets else np.nan,
-    }
-    return out
 
 def finetune_stage2_levelB(
     policy: JointBandPolicy,
@@ -516,6 +369,7 @@ def finetune_stage2_levelB(
     n_cases=32,
     lam_choices=(0.99, 0.995),
     frac_choices=(0.3, 0.5, 0.7),
+    gcfg=gcfg,
     )
 
     # (optional) fine-tune 前のB評価
@@ -527,7 +381,7 @@ def finetune_stage2_levelB(
         gcfg=gcfg,
         lam_choices=lam_choices,
         target_choices=target_choices,
-        batch_episodes=16,
+        batch_episodes=8,
         R=R,
         mv_allow_cash=mv_allow_cash,
         mv_solver=mv_solver,
@@ -547,7 +401,7 @@ def finetune_stage2_levelB(
             gcfg=gcfg,
             lam_choices=lam_choices,
             target_choices=target_choices,
-            batch_episodes=16,
+            batch_episodes=8,
             R=R0,
             mv_allow_cash=mv_allow_cash,
             mv_solver=mv_solver,
@@ -616,7 +470,7 @@ def finetune_stage2_levelB(
                  gcfg=gcfg,
                  lam_choices=lam_choices,
                  target_choices=target_choices,
-                 batch_episodes=16,
+                 batch_episodes=8,
                  R=R,
                  mv_allow_cash=mv_allow_cash,
                  mv_solver=mv_solver,
@@ -630,7 +484,7 @@ def finetune_stage2_levelB(
                 gcfg=gcfg,
                 lam_choices=lam_choices,
                 target_choices=target_choices,
-                batch_episodes=16,
+                batch_episodes=8,
                 R=R,  # env_ctor を使うならダミーでもOK
                 mv_allow_cash=mv_allow_cash,
                 mv_solver=mv_solver,
@@ -651,7 +505,7 @@ def finetune_stage2_levelB(
                 gcfg=gcfg,
                 lam_choices=lam_choices,
                 target_choices=target_choices,
-                batch_episodes=16,
+                batch_episodes=8,
                 R=Rk,
                 mv_allow_cash=mv_allow_cash,
                 mv_solver=mv_solver,
@@ -680,13 +534,16 @@ def finetune_stage2_levelB(
 if __name__ == "__main__":
     gcfg = globalsetting()
     gcfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gcfg.OBS_BETA_ZERO = True
+    gcfg.TARGET_ETA = 0.0
+    gcfg.years = 1
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--regime_json", type=str, default=None, help="path to regime json (K=2 etc). If provided, use RegimeGBM env.")
     ap.add_argument("--policy_in", type=str, default="policy_stage2_A2.pt")
     ap.add_argument("--value_in",  type=str, default="value_stage2_A2.pt")
-    ap.add_argument("--policy_out", type=str, default="policy_stage2_B2_2_finetuned.pt")
-    ap.add_argument("--value_out",  type=str, default="value_stage2_B2_2_finetuned.pt")
+    ap.add_argument("--policy_out", type=str, default="policy_stage2_B2_2_betazero_finetuned.pt")
+    ap.add_argument("--value_out",  type=str, default="value_stage2_B2_2_betazero_finetuned.pt")
     ap.add_argument("--corr_randomize", action="store_true", help="randomize correlation/sigmas per episode during finetune (also in regime mode)")
     ap.add_argument("--ckpt_dir", type=str, default="checkpoints_regime_B2/finetune_runs")
     ap.add_argument("--save_every", type=int, default=1)
@@ -717,10 +574,9 @@ if __name__ == "__main__":
     else:
         gcfg.REGIME_GAMMA_ON_OBS = True
         K = int(len(regimes))
-    gcfg.OBS_BETA_ZERO = True
 
     cfg = PPOConfig()
-    cfg.batch_episodes = 16          # B rollout重いのでまず小さめ推奨
+    cfg.batch_episodes = 8          # B rollout重いのでまず小さめ推奨
     cfg.epochs = 4
     cfg.minibatch_size = 2048
     cfg.global_dim = 4 + K
@@ -745,7 +601,7 @@ if __name__ == "__main__":
     print(f"[load] policy: loaded={len(pi_msg['loaded'])}, skipped={len(pi_msg['skipped'])}, missing={len(pi_msg['missing'])}")
     print(f"[load] value : loaded={len(v_msg['loaded'])}, skipped={len(v_msg['skipped'])}, missing={len(v_msg['missing'])}")
 
-    lam_choices = [0.990, 0.995]  # 例（あなたの実験に合わせて）
+    lam_choices = [0.99,0.995]  # 例（あなたの実験に合わせて）
     target_choices = None
 
     finetune_stage2_levelB(
@@ -755,8 +611,8 @@ if __name__ == "__main__":
         fine_tune_epochs=6,      # ★ここを5〜10で
         width_prior_w=0.02,
         mv_allow_cash=False,
-        mv_solver="OSQP",
-        qp_solver="OSQP",
+        mv_solver="SCS",
+        qp_solver="SCS",
         topk = 2,
         env_ctor=env_ctor,
         domain_randomize=True,

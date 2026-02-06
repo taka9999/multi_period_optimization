@@ -401,7 +401,7 @@ def _jsonify_regimes_for_env(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-start", type=str, default="1991-01-01")
-    parser.add_argument("--train-end", type=str, default="2018-12-31")
+    parser.add_argument("--train-end", type=str, default="2010-12-31")
     parser.add_argument("--cols", type=str, default="LargeCap,MidCap,SmallCap,EAFE,EM",
                         help="comma-separated asset columns")
     parser.add_argument("--rf-col", type=str, default="TBill")

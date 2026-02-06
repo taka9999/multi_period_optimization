@@ -401,7 +401,7 @@ def run_episode_RL_band_A2_hist(
         delta = compute_delta_box(
             w_star=m_star,
             Cov=Cov_ann,  # keep consistent with historical center
-            gamma=float(getattr(cfg, "RISK_GAMMA", 1.0)),
+            gamma=float(getattr(cfg, "RISK_GAMMA", 0.0)),
             lam=lam_scalar,
             scale=1.0,
             clip=(0.0, 1.0),
@@ -486,7 +486,7 @@ def run_episode_RL_band_B2_hist(
     U, delta_z = compute_levelB_basis_and_width(
         m_star=m_star,
         Cov=Cov_ann,
-        gamma=float(getattr(cfg, "RISK_GAMMA", 1.0)),
+        gamma=float(getattr(cfg, "RISK_GAMMA", 0.0)),
         lam_scalar=lam_scalar,
         scale=1.0,
     )

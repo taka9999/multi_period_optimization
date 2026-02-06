@@ -1,6 +1,4 @@
 """
-historical_eval_full.py
-
 End-to-end script:
   load asset_returns.pkl (log returns)
   choose columns to match globalcfg.N_ASSETS
@@ -37,11 +35,10 @@ import matplotlib.pyplot as plt
 import cvxpy as cp
 import torch
 
-from src.historical import env
-from src.historical.env import HistoricalBandEnvMulti
+from src.historical.env import HistoricalBandEnvMulti            # ←そのまま
 from src.utils.rlopt_helpers import clamp01_vec
 from src.ppo.agent import JointBandPolicy
-from src.ppo.rollout import compute_delta_box, compute_delta_rotated, apply_topk_s
+from src.ppo.rollout import compute_delta_box, apply_topk_s, mv_center_qp
 from src.regime_gbm.gbm_env import globalsetting
 
 globalcfg = globalsetting()   # <- instantiate
@@ -396,19 +393,16 @@ def safe_log_wealth(W, eps=1e-12):
 def mv_weights_target_return(
     Cov, mu_eff, target_ann, allow_cash=True, solver="OSQP", infeasible_policy="skip"
 ):
-    """
-    min w^T Cov w
-    s.t. mu_eff^T w >= target_ann, w>=0, sum(w)<=1 (cash allowed)
+    Cov = np.asarray(Cov, float)
+    if target_ann is None:
+        n = Cov.shape[0]
+        mu_eff = None
+    else:
+        mu_eff = np.asarray(mu_eff, float).reshape(-1)
+        n = len(mu_eff)
+        mu_max = float(mu_eff.max())
 
-    infeasible_policy:
-      - "skip": return None if target_ann > max(mu_eff)
-      - "fallback": invest 100% in argmax(mu_eff)
-    """
-    mu_eff = np.asarray(mu_eff, float).reshape(-1)
-    n = len(mu_eff)
-    mu_max = float(mu_eff.max())
-
-    if target_ann > mu_max + 1e-12:
+    if target_ann is not None and target_ann > mu_max + 1e-12:
         if infeasible_policy == "skip":
             return None
         ww = np.zeros(n)
@@ -417,7 +411,10 @@ def mv_weights_target_return(
 
     w = cp.Variable(n)
     obj = cp.Minimize(cp.quad_form(w, Cov))
-    cons = [w >= 0, mu_eff @ w >= float(target_ann)]
+    cons = [w >= 0]
+    if target_ann is not None:
+        cons += [mu_eff @ w >= float(target_ann)]
+    #cons = [w >= 0, mu_eff @ w >= float(target_ann)]
     cons += [cp.sum(w) <= 1.0] if allow_cash else [cp.sum(w) == 1.0]
     prob = cp.Problem(obj, cons)
 
@@ -455,68 +452,7 @@ def estimate_mu_cov_ann_from_log_window(window_log: np.ndarray, dt: float):
     Cov_ann = Cov_daily / dt
     return mu_ann, Cov_ann
 
-def rolling_mu_cov(
-    returns_log: np.ndarray,
-    *,
-    end_idx: int,
-    lookback: int,
-    dt: float,
-):
-    """
-    Use past lookback window [end_idx-lookback, end_idx)
-    """
-    i0 = max(0, end_idx - lookback)
-    window = returns_log[i0:end_idx]
-    if window.shape[0] < 2:
-        return None, None
-    return estimate_mu_cov_ann_from_log_window(window, dt=dt)
 
-def _burnin_slice_rs(rsimple: np.ndarray, burnin_steps: int) -> np.ndarray:
-    """Return rsimple after dropping the first burnin_steps (safe for burnin_steps=0)."""
-    r = np.asarray(rsimple, float).reshape(-1)
-    b = int(max(0, burnin_steps))
-    if b <= 0:
-        return r
-    if b >= r.size:
-        return r[0:0]
-    return r[b:]
-
-
-def _burnin_slice_for_plot(
-    dates: pd.DatetimeIndex,
-    rsimple: np.ndarray,
-    burnin_steps: int,
-    *,
-    w0: float = 100.0,
-    renormalize: bool = True,
-):
-    """
-    Slice (dates, wealth) to exclude burn-in from plots while keeping paths comparable.
-
-    - rsimple length = T
-    - wealth length  = T+1
-    - dates length   >= T (we use the first T entries as step dates)
-    Returns:
-        dates_plot: length (T-b)
-        W_plot:     length (T-b)+1
-    """
-    dates = pd.DatetimeIndex(dates)
-    r = np.asarray(rsimple, float).reshape(-1)
-    T = min(len(dates), len(r))
-    dates_step = dates[:T]
-    r = r[:T]
-    b = int(max(0, burnin_steps))
-    b = min(b, T)
-
-    W_full = wealth_from_rsimple(r, w0=w0)  # length T+1
-    W_plot = W_full[b:]                     # length (T-b)+1
-    dates_plot = dates_step[b:]             # length (T-b)
-    if renormalize and W_plot.size > 0:
-        base = float(W_plot[0])
-        if abs(base) > 1e-12:
-            W_plot = W_plot / base * w0
-
-    return dates_plot, W_plot
 # ============================================================
 # 4) Episode runners (Historical)
 # ============================================================
@@ -544,14 +480,14 @@ def run_episode_MV_daily_frictionless_hist(
     )
     N = cfg.N_ASSETS
     w0 = np.full(N, 1.0 / N) * 0.8
-    _ = env.reset(beta=np.zeros(N), lam=1.0, target_ret=target_ann, w0=w0)
+    _ = env.reset(beta=np.zeros(N), lam=1.0, target_ret=None, w0=w0)
 
     window = np.asarray(returns_log[start_idx : start_idx + T_days], float)
-    target_ann_eff = float(env.target_ret_ann)
+    #target_ann_eff = float(env.target_ret_ann)
 
     mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(window, dt=float(cfg.dt_day))
     w_star = mv_weights_target_return(
-        Cov_ann, mu_ann, target_ann_eff, allow_cash=False, solver=mv_solver, infeasible_policy=infeasible_policy
+        Cov_ann, mu_ann, target_ann = None, allow_cash=True, solver=mv_solver, infeasible_policy=infeasible_policy
     )
     if w_star is None:
         return None
@@ -591,185 +527,31 @@ def run_episode_MV_monthly_cost_hist(
     )
     N = cfg.N_ASSETS
     w0 = np.full(N, 1.0 / N) * 0.8
-    _ = env.reset(beta=np.zeros(N), lam=lam_cost, target_ret=target_ann, w0=w0)
-    
-    target_ann_eff = float(env.target_ret_ann)
-    #window = np.asarray(returns_log[start_idx : start_idx + T_days], float)
-    #mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(window, dt=float(cfg.dt_day))
-    #w_star = mv_weights_target_return(
-    #    Cov_ann, mu_ann, target_ann_eff, allow_cash=False, solver=mv_solver, infeasible_policy=infeasible_policy
-    #)
-    #if w_star is None:
-    #    return None
+    _ = env.reset(beta=np.zeros(N), lam=lam_cost, target_ret=None, w0=w0)
+
+    window = np.asarray(returns_log[start_idx : start_idx + T_days], float)
+    #target_ann_eff = float(env.target_ret_ann)
+
+    mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(window, dt=float(cfg.dt_day))
+    w_star = mv_weights_target_return(
+        Cov_ann, mu_ann, target_ann = None, allow_cash=True, solver=mv_solver, infeasible_policy=infeasible_policy
+    )
+    if w_star is None:
+        return None
 
     rs = []
-    inside_cnt = outside_cnt = 0
-    trigger_cnt = 0
-    turnover_sum = sold_sum = cost_drag_sum = 0.0
-    dist_sum = 0.0
-    action_sum = 0.0
-    width_all = []
-
-    lookback = 252
-    w_star = None
-    mu_ann = Cov_ann = None
-    
     for t in range(env.T):
-        # --- recompute MV center on rebalance days (or keep previous if not enough history) ---
         if (t % rebalance_every) == 0:
-            mu_ann, Cov_ann = rolling_mu_cov(
-                returns_log,
-                end_idx=start_idx + t,
-                lookback=lookback,
-                dt=float(cfg.dt_day),
-            )
-            if mu_ann is not None:
-                w_new = mv_weights_target_return(
-                    Cov_ann, mu_ann, target_ann_eff,
-                    allow_cash=False,
-                    solver=mv_solver,
-                    infeasible_policy=infeasible_policy
-                )
-                if w_new is not None:
-                    w_star = w_new
-
-        # --- choose band: trade only on rebalance days if w_star exists; otherwise no-trade (wide band) ---
-        if w_star is None:
-            A = np.zeros(N)
-            B = np.ones(N)
-        elif (t % rebalance_every) == 0:
-            A = w_star.copy()
-            B = w_star.copy()
+            A = w_star
+            B = w_star
         else:
             A = np.zeros(N)
             B = np.ones(N)
-        #obs, r_step, done, r_simple = env.step(A, B, use_trade_penalty=True)
-        # logging: intended trade only on rebalance days
-        w_pre, Y_prev = _get_weights_and_wealth(env)
-        if w_pre is not None:
-            inside = bool(np.all(w_pre >= A - 1e-12) and np.all(w_pre <= B + 1e-12))
-            if inside: inside_cnt += 1
-            else:      outside_cnt += 1
-            dist = 0.0 if inside else _distance_to_band_axis(w_pre, A, B)
-        else:
-            dist = np.nan
-
-        # action/band width (axis-aligned)
-        width = float(np.mean(np.abs(B - A)))
-        action_norm = float(np.linalg.norm(0.5 * (B - A)))
- 
-        obs, r, done, r_simple = env.step(A, B)
- 
-        if w_pre is not None and Y_prev is not None:
-            lam_scalar = float(env.lam.mean()) if isinstance(env.lam, np.ndarray) else float(env.lam)
-            st = _trade_stats_step(env, w_pre, Y_prev, lam_scalar)
-            if st.get("did_trade", False):
-                trigger_cnt += 1
-            if np.isfinite(st["turnover"]):   turnover_sum += st["turnover"]
-            if np.isfinite(st["sold_total"]): sold_sum     += st["sold_total"]
-            if np.isfinite(st["cost_drag"]):  cost_drag_sum+= st["cost_drag"]
-        if np.isfinite(dist): dist_sum += dist
-        action_sum += action_norm
-        width_all.append(width)
+        obs, r_step, done, r_simple = env.step(A, B, use_trade_penalty=True)
         rs.append(float(r_simple))
         if done:
             break
-    stats = _finalize_stats(
-        steps=len(rs),
-        inside_cnt=inside_cnt, outside_cnt=outside_cnt,
-        trigger_cnt=trigger_cnt,
-        turnover_sum=turnover_sum, sold_sum=sold_sum, cost_drag_sum=cost_drag_sum,
-        dist_sum=dist_sum, action_sum=action_sum,
-        width_all=np.asarray(width_all),
-        mstar_shift=0.0,
-    )
-    return dict(rs=np.asarray(rs, float), stats=stats)
-
-def run_episode_EW_monthly_cost_hist(
-    cfg,
-    R_corr,
-    returns_log,
-    lam_cost,
-    *,
-    start_idx: int,
-    T_days: int,
-    rebalance_every: int = 21,
-    seed: int = 2025,
-):
-    cfg.seed = int(seed)
-
-    env = HistoricalBandEnvMulti(
-        cfg=cfg,
-        R=R_corr,
-        returns_log=returns_log,
-        start_idx=int(start_idx),
-        T_days=int(T_days),
-        returns_are_excess=False,
-    )
-    N = cfg.N_ASSETS
-    w0 = np.full(N, 1.0 / N) * 0.8
-    _ = env.reset(beta=np.zeros(N), lam=lam_cost, target_ret=0.0, w0=w0)
-
-    w_eq = np.full(N, 1.0 / N, dtype=float)
-
-    rs = []
-    inside_cnt = outside_cnt = 0
-    trigger_cnt = 0
-    turnover_sum = sold_sum = cost_drag_sum = 0.0
-    dist_sum = 0.0
-    action_sum = 0.0
-    width_all = []
-
-    for t in range(env.T):
-        # rebalance day: force trade to equal-weight
-        if (t % rebalance_every) == 0:
-            A = w_eq.copy()
-            B = w_eq.copy()
-        else:
-            A = np.zeros(N)
-            B = np.ones(N)
-
-        w_pre, Y_prev = _get_weights_and_wealth(env)
-        if w_pre is not None:
-            inside = bool(np.all(w_pre >= A - 1e-12) and np.all(w_pre <= B + 1e-12))
-            if inside: inside_cnt += 1
-            else:      outside_cnt += 1
-            dist = 0.0 if inside else _distance_to_band_axis(w_pre, A, B)
-        else:
-            dist = np.nan
-
-        width = float(np.mean(np.abs(B - A)))
-        action_norm = float(np.linalg.norm(0.5 * (B - A)))
-
-        obs, r, done, r_simple = env.step(A, B)
-
-        if w_pre is not None and Y_prev is not None:
-            lam_scalar = float(env.lam.mean()) if isinstance(env.lam, np.ndarray) else float(env.lam)
-            st = _trade_stats_step(env, w_pre, Y_prev, lam_scalar)
-            if st.get("did_trade", False):
-                trigger_cnt += 1
-            if np.isfinite(st["turnover"]):   turnover_sum += st["turnover"]
-            if np.isfinite(st["sold_total"]): sold_sum     += st["sold_total"]
-            if np.isfinite(st["cost_drag"]):  cost_drag_sum+= st["cost_drag"]
-
-        if np.isfinite(dist): dist_sum += dist
-        action_sum += action_norm
-        width_all.append(width)
-
-        rs.append(float(r_simple))
-        if done:
-            break
-
-    stats = _finalize_stats(
-        steps=len(rs),
-        inside_cnt=inside_cnt, outside_cnt=outside_cnt,
-        trigger_cnt=trigger_cnt,
-        turnover_sum=turnover_sum, sold_sum=sold_sum, cost_drag_sum=cost_drag_sum,
-        dist_sum=dist_sum, action_sum=action_sum,
-        width_all=np.asarray(width_all),
-        mstar_shift=0.0,
-    )
-    return dict(rs=np.asarray(rs, float), stats=stats)
+    return np.array(rs, float)
 
 
 def run_episode_RL_band_A2_hist(
@@ -801,59 +583,20 @@ def run_episode_RL_band_A2_hist(
     )
     N = cfg.N_ASSETS
     w0 = np.full(N, 1.0 / N) * 0.8
-    obs = env.reset(beta=np.zeros(N), lam=lam_cost, target_ret=target_ann, w0=w0)
+    obs = env.reset(beta=np.zeros(N), lam=lam_cost, target_ret=None, w0=w0)
 
-    target_ann_eff = float(env.target_ret_ann)
+    window = np.asarray(returns_log[start_idx : start_idx + T_days], float)
+    #target_ann_eff = float(env.target_ret_ann)
 
-    #window = np.asarray(returns_log[start_idx : start_idx + T_days], float)
-    #mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(window, dt=float(cfg.dt_day))
-    #m_star = mv_weights_target_return(
-    #    Cov_ann, mu_ann, target_ann_eff, allow_cash=False, solver=mv_solver, infeasible_policy=infeasible_policy
-    #)
-    #if m_star is None:
-    #    return None
+    mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(window, dt=float(cfg.dt_day))
+    m_star = mv_weights_target_return(
+        Cov_ann, mu_ann, target_ann = None, allow_cash=True, solver=mv_solver, infeasible_policy=infeasible_policy
+    )
+    if m_star is None:
+        return None
 
     rs = []
-    inside_cnt = outside_cnt = 0
-    trigger_cnt = 0
-    turnover_sum = sold_sum = cost_drag_sum = 0.0
-    dist_sum = 0.0
-    action_sum = 0.0
-    width_all = []
-
-    lookback = 252
-    m_star = None
-    mu_ann = Cov_ann = None
-    rebalance_every = 21
-
     for _t in range(env.T):
-        b = np.zeros(N, dtype=float)
-        if (_t % rebalance_every) == 0:
-            mu_ann, Cov_ann = rolling_mu_cov(
-                returns_log,
-                end_idx=start_idx + _t,
-                lookback=lookback,
-                dt=float(cfg.dt_day),
-            )
-            if mu_ann is not None:
-                m_new = mv_weights_target_return(
-                    Cov_ann, mu_ann, target_ann_eff,
-                    allow_cash=False,
-                    solver=mv_solver,
-                    infeasible_policy=infeasible_policy,
-                )
-                if m_new is not None:
-                    m_star = m_new
-        if (m_star is None) or (Cov_ann is None):
-            A = np.zeros(N)
-            B = np.ones(N)
-            width = float(np.mean(np.abs(B - A)))
-            action_norm = float(np.linalg.norm(b))  # = 0
-            obs, r, done, r_simple = env.step(A, B)
-            rs.append(float(r_simple))
-            if done:
-                break
-            continue
         o = np.array(obs, dtype=np.float32)
         if gamma_seq is not None:
             o = augment_obs_with_gamma(o, gamma_seq[_t])
@@ -868,68 +611,29 @@ def run_episode_RL_band_A2_hist(
         if force_s_one:
             s = np.ones_like(s, dtype=float)
 
-
-        # If MV center is not available yet, fall back to no-trade wide band
+        m = m_star
+        minm = np.minimum(m, 1.0 - m)
         lam_scalar = float(env.lam.mean()) if isinstance(env.lam, np.ndarray) else float(env.lam)
-        if (m_star is None) or (Cov_ann is None):
-            A = np.zeros(N)
-            B = np.ones(N)
-        else:
-            m = np.asarray(m_star, float).reshape(-1)
-            minm = np.minimum(m, 1.0 - m)
 
-            delta = compute_delta_box(
-                w_star=m,
-                Cov=Cov_ann,
-                gamma=float(getattr(cfg, "RISK_GAMMA", 0.0)),
-                lam=lam_scalar,
-                scale=1.0,
-                clip=(0.0, 1.0),
-            )
+        delta = compute_delta_box(
+            w_star=m_star,
+            Cov=Cov_ann,  # keep consistent with historical center
+            gamma=float(getattr(cfg, "RISK_GAMMA", 0.0)),
+            lam=lam_scalar,
+            scale=1.0,
+            clip=(0.0, 1.0),
+        )
 
-            b = 0.95 * s * delta * minm
-            A = clamp01_vec(m - b)
-            B = np.maximum(A + 1e-6, m + b)
+        b = 0.95 * s * delta * minm
+        A = clamp01_vec(m - b)
+        B = np.maximum(A + 1e-6, m + b)
 
-        #obs, r_step, done, r_simple = env.step(A, B, use_trade_penalty=True)
-        # inside check (axis box)
-        w_pre, Y_prev = _get_weights_and_wealth(env)
-        if w_pre is not None:
-            inside = bool(np.all(w_pre >= A - 1e-12) and np.all(w_pre <= B + 1e-12))
-            if inside: inside_cnt += 1
-            else:      outside_cnt += 1
-            dist = 0.0 if inside else _distance_to_band_axis(w_pre, A, B)
-        else:
-            dist = np.nan
-        width = float(np.mean(np.abs(B - A)))
-        action_norm = float(np.linalg.norm(b))
-
-        obs, r, done, r_simple = env.step(A, B)
- 
-        if w_pre is not None and Y_prev is not None:
-            st = _trade_stats_step(env, w_pre, Y_prev, lam_scalar)
-            if st.get("did_trade", False):
-                trigger_cnt += 1
-            if np.isfinite(st["turnover"]):   turnover_sum += st["turnover"]
-            if np.isfinite(st["sold_total"]): sold_sum     += st["sold_total"]
-            if np.isfinite(st["cost_drag"]):  cost_drag_sum+= st["cost_drag"]
-        if np.isfinite(dist): dist_sum += dist
-        action_sum += action_norm
-        width_all.append(width)
+        obs, r_step, done, r_simple = env.step(A, B, use_trade_penalty=True)
         rs.append(float(r_simple))
         if done:
             break
 
-    stats = _finalize_stats(
-        steps=len(rs),
-        inside_cnt=inside_cnt, outside_cnt=outside_cnt,
-        trigger_cnt=trigger_cnt,
-        turnover_sum=turnover_sum, sold_sum=sold_sum, cost_drag_sum=cost_drag_sum,
-        dist_sum=dist_sum, action_sum=action_sum,
-        width_all=np.asarray(width_all),
-        mstar_shift=0.0,
-    )
-    return dict(rs=np.asarray(rs, float), stats=stats)
+    return np.array(rs, float)
 
 
 def compute_levelB_basis_and_width(m_star, Cov, gamma, lam_scalar, eps=1e-12, scale=1.0):
@@ -944,9 +648,8 @@ def compute_levelB_basis_and_width(m_star, Cov, gamma, lam_scalar, eps=1e-12, sc
     eigvals, U = np.linalg.eigh(a)
     eigvals = np.maximum(eigvals, 0.0)
 
-    gamma_eff = 1 + float(gamma)
     Cov_rot = U.T @ Cov @ U
-    Gamma_kk = np.maximum(eps, gamma_eff * np.maximum(eps, np.diag(Cov_rot)))
+    Gamma_kk = np.maximum(eps, float(gamma) * np.maximum(eps, np.diag(Cov_rot)))
 
     delta_z = scale * np.power((kappa * eigvals) / Gamma_kk, 1.0 / 3.0)
     delta_z = np.maximum(delta_z, 0.0)
@@ -968,7 +671,7 @@ def run_episode_RL_band_B2_hist(
     mv_solver: str = "OSQP",
     qp_solver: str = "OSQP",
     infeasible_policy: str = "skip",
-    mv_allow_cash: bool = False,
+    mv_allow_cash: bool = True,
     force_s_one: bool = False,
     topk: int | None = None,
     gamma_seq: np.ndarray | None = None,
@@ -985,89 +688,29 @@ def run_episode_RL_band_B2_hist(
     )
     N = cfg.N_ASSETS
     w0 = np.full(N, 1.0 / N) * 0.8
-    obs = env.reset(beta=np.zeros(N), lam=lam_cost, target_ret=target_ann, w0=w0)
+    obs = env.reset(beta=np.zeros(N), lam=lam_cost, target_ret=None, w0=w0)
 
-    target_ann_eff = float(env.target_ret_ann)
+    window = np.asarray(returns_log[start_idx : start_idx + T_days], float)
+    #target_ann_eff = float(env.target_ret_ann)
 
-    #window = np.asarray(returns_log[start_idx : start_idx + T_days], float)
-    #mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(window, dt=float(cfg.dt_day))
-    #m_star = mv_weights_target_return(
-    #    Cov_ann, mu_ann, target_ann_eff, allow_cash=mv_allow_cash, solver=mv_solver, infeasible_policy=infeasible_policy
-    #)
-    #if m_star is None:
-    #    return None
-    
-    # sanitize m* (important near simplex boundary; keeps projection stable)
-    #m_star = np.asarray(m_star, dtype=float).reshape(-1)
-    #m_star = np.clip(m_star, 0.0, 1.0)
-    #ssum = float(m_star.sum())
-    #if mv_allow_cash:
-    #    if ssum > 1.0 + 1e-12:
-    #        m_star = m_star / (ssum + 1e-30)
-    #else:
-    #    m_star = m_star / (ssum + 1e-30)
-
-    #U, delta_z = compute_levelB_basis_and_width(
-    #    m_star=m_star,
-    #    Cov=Cov_ann,
-    #    gamma=float(getattr(cfg, "RISK_GAMMA", 0.0)),
-    #    lam_scalar=lam_scalar,
-    #    scale=1.0,
-    #)
-    
-
-    rs = []
-    inside_cnt = outside_cnt = 0
-    trigger_cnt = 0
-    turnover_sum = sold_sum = cost_drag_sum = 0.0
-    dist_sum = 0.0
-    action_sum = 0.0
-    width_all = []
-
-    lookback = 252
-    m_star = None
-    mu_ann = Cov_ann = None
-    rebalance_every = 21
+    mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(window, dt=float(cfg.dt_day))
+    m_star = mv_weights_target_return(
+        Cov_ann, mu_ann, target_ann=None, allow_cash=mv_allow_cash, solver=mv_solver, infeasible_policy=infeasible_policy
+    )
+    if m_star is None:
+        return None
 
     lam_scalar = float(env.lam.mean()) if isinstance(env.lam, np.ndarray) else float(env.lam)
-    gamma_use = float(getattr(cfg, "RISK_GAMMA", getattr(env.cfg, "RISK_GAMMA", 0.0)))
+    U, delta_z = compute_levelB_basis_and_width(
+        m_star=m_star,
+        Cov=Cov_ann,
+        gamma=float(getattr(cfg, "RISK_GAMMA", 0.0)),
+        lam_scalar=lam_scalar,
+        scale=1.0,
+    )
 
+    rs = []
     for _t in range(env.T):
-        b = np.zeros(N, dtype=float)
-        if (_t % rebalance_every) == 0:
-            mu_ann, Cov_ann = rolling_mu_cov(
-                returns_log,
-                end_idx=start_idx + _t,
-                lookback=lookback,
-                dt=float(cfg.dt_day),
-            )
-            if mu_ann is not None:
-                m_new = mv_weights_target_return(
-                    Cov_ann, mu_ann, target_ann_eff,
-                    allow_cash=False,
-                    solver=mv_solver,
-                    infeasible_policy=infeasible_policy,
-                )
-                if m_new is not None:
-                    m_star = m_new
-                    U, delta_z = compute_delta_rotated(
-                        m_star=m_star,
-                        Cov=Cov_ann,
-                        gamma=gamma_use,
-                        lam=lam_scalar,
-                        scale=1.0,
-                        debug=False,
-                        )
-        if (m_star is None) or (Cov_ann is None):
-            A = np.zeros(N)
-            B = np.ones(N)
-            width = float(np.mean(np.abs(B - A)))
-            action_norm = float(np.linalg.norm(b))  # = 0
-            obs, r, done, r_simple = env.step(A, B)
-            rs.append(float(r_simple))
-            if done:
-                break
-            continue
         o = np.array(obs, dtype=np.float32)
         if gamma_seq is not None:
             o = augment_obs_with_gamma(o, gamma_seq[_t])
@@ -1081,64 +724,23 @@ def run_episode_RL_band_B2_hist(
                 else:
                     _, s_t, _, _, _ = policy.sample_stage2(torch.tensor(o, device=device).unsqueeze(0))
                     s = s_t.squeeze(0).detach().cpu().numpy()
-        
-        s_eff = apply_topk_s(s, topk=topk)
-        # If rotated box params not available yet, fall back to no-trade wide band
-        if (m_star is None) or (Cov_ann is None):
-            A = np.zeros(N)
-            B = np.ones(N)
-            # logging/inside check uses A,B form for this step
-            w_pre, Y_prev = _get_weights_and_wealth(env)
-            if w_pre is not None:
-                inside = bool(np.all(w_pre >= A - 1e-12) and np.all(w_pre <= B + 1e-12))
-                if inside: inside_cnt += 1
-                else:      outside_cnt += 1
-                dist = 0.0 if inside else _distance_to_band_axis(w_pre, A, B)
-            else:
-                dist = np.nan
-            width = float(np.mean(np.abs(B - A)))
-            action_norm = 0.0
-            obs, r, done, r_simple = env.step(A, B)
-        else:
-            b_z = 0.95 * s_eff * delta_z
-            # inside check (rotated box)
-            w_pre, Y_prev = _get_weights_and_wealth(env)
-            if w_pre is not None:
-                z = U.T @ (w_pre - m_star)
-                inside = bool(np.all(np.abs(z) <= b_z + 1e-12))
-                if inside: inside_cnt += 1
-                else:      outside_cnt += 1
-                dist = 0.0 if inside else _distance_to_band_rotated(w_pre, m_star, U, b_z)
-            else:
-                dist = np.nan
-            width = float(np.mean(2.0 * b_z))
-            action_norm = float(np.linalg.norm(b_z))
-            obs, r, done, r_simple = env.step_rotated_box(m=m_star, U=U, b_z=b_z, allow_cash=mv_allow_cash)
 
-        if w_pre is not None and Y_prev is not None:
-            st = _trade_stats_step(env, w_pre, Y_prev, lam_scalar)
-            if st.get("did_trade", False):
-                trigger_cnt += 1
-            if np.isfinite(st["turnover"]):   turnover_sum += st["turnover"]
-            if np.isfinite(st["sold_total"]): sold_sum     += st["sold_total"]
-            if np.isfinite(st["cost_drag"]):  cost_drag_sum+= st["cost_drag"]
-        if np.isfinite(dist): dist_sum += dist
-        action_sum += action_norm
-        width_all.append(width)
+        s_eff = apply_topk_s(s, topk=topk)
+        b_z = 0.95 * s_eff * delta_z
+
+        obs, r_step, done, r_simple = env.step_rotated_box(
+            m=m_star,
+            U=U,
+            b_z=b_z,
+            allow_cash=mv_allow_cash,
+            solver=qp_solver,
+            use_trade_penalty=True,
+        )
         rs.append(float(r_simple))
         if done:
             break
 
-    stats = _finalize_stats(
-        steps=len(rs),
-        inside_cnt=inside_cnt, outside_cnt=outside_cnt,
-        trigger_cnt=trigger_cnt,
-        turnover_sum=turnover_sum, sold_sum=sold_sum, cost_drag_sum=cost_drag_sum,
-        dist_sum=dist_sum, action_sum=action_sum,
-        width_all=np.asarray(width_all),
-        mstar_shift=0.0,
-    )
-    return dict(rs=np.asarray(rs, float), stats=stats)
+    return np.array(rs, float)
 
 
 # ============================================================
@@ -1160,20 +762,14 @@ def eval_frontier_historical(
     qp_solver: str = "OSQP",
     infeasible_policy: str = "skip",
     gamma_all: np.ndarray | None = None,
-    outdir: str | None = None,
-    burnin_steps: int = 0,
 ):
     N = cfg.N_ASSETS
     # R_corr is unused for historical center (we use Cov_ann), but env signature requires it.
     R_corr = np.eye(N, dtype=float)
 
-    #strategies = ["MV_daily_frictionless", "MV_monthly_cost", "RL_band_A2", "RL_band_B2"]
-    #strategies = ["MV_daily_frictionless", "MV_monthly_cost", "EW_monthly_cost", "RL_band_A2", "RL_band_B2"]
-    strategies = ["MV_monthly_cost", "EW_monthly_cost", "RL_band_A2", "RL_band_B2"]
-
+    strategies = ["MV_daily_frictionless", "MV_monthly_cost", "RL_band_A2", "RL_band_B2"]
     raw = {s: {t: [] for t in targets} for s in strategies}
     skipped = {s: {t: 0 for t in targets} for s in strategies}
-    trade_rows = []  # per-run aggregated stats -> CSV
 
     T_max_start = int(returns_log.shape[0] - T_days - 1)
     if T_max_start <= 0:
@@ -1191,93 +787,66 @@ def eval_frontier_historical(
 
         for t_ann in targets:
             # MV daily
-            #rs0 = run_episode_MV_daily_frictionless_hist(
-            #    cfg, R_corr, returns_log, t_ann,
-            #    start_idx=start_idx, T_days=T_days, seed=seed,
-            #    mv_solver=mv_solver, infeasible_policy=infeasible_policy
-            #)
-            #if rs0 is None:
-            #    skipped["MV_daily_frictionless"][t_ann] += 1
-            #else:
-            #    rs0_eval = _burnin_slice_rs(rs0, burnin_steps)
-            #    ar = ann_arith_mean_vol_from_rsimple(rs0_eval, dt=float(cfg.dt_day))
-            #    ge = ann_geom_mean_vol_from_rsimple(rs0_eval, dt=float(cfg.dt_day))
-            #    raw["MV_daily_frictionless"][t_ann].append(
-            #        {"arith": ar, "geom": ge, "sh_arith": sharpe_from_ann(*ar), "sh_geom": sharpe_from_ann(*ge)}
-            #    )
+            rs0 = run_episode_MV_daily_frictionless_hist(
+                cfg, R_corr, returns_log, t_ann,
+                start_idx=start_idx, T_days=T_days, seed=seed,
+                mv_solver=mv_solver, infeasible_policy=infeasible_policy
+            )
+            if rs0 is None:
+                skipped["MV_daily_frictionless"][t_ann] += 1
+            else:
+                ar = ann_arith_mean_vol_from_rsimple(rs0, dt=float(cfg.dt_day))
+                ge = ann_geom_mean_vol_from_rsimple(rs0, dt=float(cfg.dt_day))
+                raw["MV_daily_frictionless"][t_ann].append(
+                    {"arith": ar, "geom": ge, "sh_arith": sharpe_from_ann(*ar), "sh_geom": sharpe_from_ann(*ge)}
+                )
 
             # MV monthly
-            out = run_episode_MV_monthly_cost_hist(
+            rsm = run_episode_MV_monthly_cost_hist(
                 cfg, R_corr, returns_log, lam_cost, t_ann,
                 start_idx=start_idx, T_days=T_days, rebalance_every=rebalance_every, seed=seed,
                 mv_solver=mv_solver, infeasible_policy=infeasible_policy
             )
-            if out is None:
+            if rsm is None:
                 skipped["MV_monthly_cost"][t_ann] += 1
             else:
-                rsm = out["rs"]; stats = out.get("stats", {})
-                rs_eval = _burnin_slice_rs(rsm, burnin_steps)
-                ar = ann_arith_mean_vol_from_rsimple(rs_eval, dt=float(cfg.dt_day))
-                ge = ann_geom_mean_vol_from_rsimple(rs_eval, dt=float(cfg.dt_day))
+                ar = ann_arith_mean_vol_from_rsimple(rsm, dt=float(cfg.dt_day))
+                ge = ann_geom_mean_vol_from_rsimple(rsm, dt=float(cfg.dt_day))
                 raw["MV_monthly_cost"][t_ann].append(
                     {"arith": ar, "geom": ge, "sh_arith": sharpe_from_ann(*ar), "sh_geom": sharpe_from_ann(*ge)}
                 )
-                trade_rows.append(dict(name="MV_monthly_cost", target=float(t_ann), seed=int(seed), start_idx=int(start_idx), **stats))
-            
-            # EW monthly
-            out = run_episode_EW_monthly_cost_hist(
-                cfg, R_corr, returns_log, lam_cost,
-                start_idx=start_idx, T_days=T_days, rebalance_every=rebalance_every, seed=seed,
-            )
-            if out is None:
-                skipped["EW_monthly_cost"][t_ann] += 1
-            else:
-                rsew = out["rs"]; stats = out.get("stats", {})
-                rs_eval = _burnin_slice_rs(rsew, burnin_steps)
-                ar = ann_arith_mean_vol_from_rsimple(rs_eval, dt=float(cfg.dt_day))
-                ge = ann_geom_mean_vol_from_rsimple(rs_eval, dt=float(cfg.dt_day))
-                raw["EW_monthly_cost"][t_ann].append(
-                    {"arith": ar, "geom": ge, "sh_arith": sharpe_from_ann(*ar), "sh_geom": sharpe_from_ann(*ge)}
-                )
-                trade_rows.append(dict(name="EW_monthly_cost", target=float(t_ann), seed=int(seed), start_idx=int(start_idx), **stats))
 
             # RL A2
-            out = run_episode_RL_band_A2_hist(
+            rsA2 = run_episode_RL_band_A2_hist(
                 cfg, R_corr, returns_log, policy_A2, lam_cost, t_ann,
                 start_idx=start_idx, T_days=T_days, seed=seed, device=cfg.device,
                 mv_solver=mv_solver, infeasible_policy=infeasible_policy,
                 gamma_seq=gamma_seq
             )
-            if out is None:
+            if rsA2 is None:
                 skipped["RL_band_A2"][t_ann] += 1
             else:
-                rsA2 = out["rs"]; stats = out.get("stats", {})
-                rsA2_eval = _burnin_slice_rs(rsA2, burnin_steps)
-                ar = ann_arith_mean_vol_from_rsimple(rsA2_eval, dt=float(cfg.dt_day))
-                ge = ann_geom_mean_vol_from_rsimple(rsA2_eval, dt=float(cfg.dt_day))
+                ar = ann_arith_mean_vol_from_rsimple(rsA2, dt=float(cfg.dt_day))
+                ge = ann_geom_mean_vol_from_rsimple(rsA2, dt=float(cfg.dt_day))
                 raw["RL_band_A2"][t_ann].append(
                     {"arith": ar, "geom": ge, "sh_arith": sharpe_from_ann(*ar), "sh_geom": sharpe_from_ann(*ge)}
                 )
-                trade_rows.append(dict(name="RL_band_A2", target=float(t_ann), seed=int(seed), start_idx=int(start_idx), **stats))
 
             # RL B2
-            out = run_episode_RL_band_B2_hist(
+            rsB2 = run_episode_RL_band_B2_hist(
                 cfg, R_corr, returns_log, policy_B2, lam_cost, t_ann,
                 start_idx=start_idx, T_days=T_days, seed=seed, device=cfg.device,
                 mv_solver=mv_solver, qp_solver=qp_solver, infeasible_policy=infeasible_policy,
                 gamma_seq=gamma_seq
             )
-            if out is None:
+            if rsB2 is None:
                 skipped["RL_band_B2"][t_ann] += 1
             else:
-                rsB2 = out["rs"]; stats = out.get("stats", {})
-                rsB2_eval = _burnin_slice_rs(rsB2, burnin_steps)
-                ar = ann_arith_mean_vol_from_rsimple(rsB2_eval, dt=float(cfg.dt_day))
-                ge = ann_geom_mean_vol_from_rsimple(rsB2_eval, dt=float(cfg.dt_day))
+                ar = ann_arith_mean_vol_from_rsimple(rsB2, dt=float(cfg.dt_day))
+                ge = ann_geom_mean_vol_from_rsimple(rsB2, dt=float(cfg.dt_day))
                 raw["RL_band_B2"][t_ann].append(
                     {"arith": ar, "geom": ge, "sh_arith": sharpe_from_ann(*ar), "sh_geom": sharpe_from_ann(*ge)}
                 )
-                trade_rows.append(dict(name="RL_band_B2", target=t_ann, seed=seed, **stats))
 
     # aggregate
     res_arith = {s: {} for s in strategies}
@@ -1304,22 +873,6 @@ def eval_frontier_historical(
                 res_sh_geom[s][t] = float(shG.mean())
 
     info = {"skipped": skipped}
-    # ---- always dump trade stats if outdir is set (keeps format stable) ----
-    if outdir is not None:
-        os.makedirs(outdir, exist_ok=True)
-        df_trade = pd.DataFrame(trade_rows)
-        # stable column order (subset ok if some fields missing)
-        col_order = [
-            "name","target","seed","start_idx",
-            "steps","inside_rate","trigger_rate",
-            "turnover_mean","sold_total_sum","cost_drag_sum",
-            "avg_distance_to_band","avg_action_norm",
-            "width_mean","width_median","width_min","width_max",
-            "mstar_shift",
-        ]
-        df_trade = df_trade[[c for c in col_order if c in df_trade.columns]]
-        df_trade.to_csv(os.path.join(outdir, "turnover_cost_stats.csv"), index=False)
-  
     return res_arith, res_geom, res_sh_arith, res_sh_geom, raw, info
 
 def make_start_indices(T_total: int, T_days: int, n_windows: int, seed: int, start_idx_list=None):
@@ -1337,106 +890,103 @@ def make_start_indices(T_total: int, T_days: int, n_windows: int, seed: int, sta
     rng = np.random.default_rng(int(seed))
     return [int(rng.integers(0, max_start)) for _ in range(int(n_windows))]
 
-# ============================================================
-# Crash-aware window selection (ensure at least 1 overlaps)
-# ============================================================
-def _pick_start_idx_to_cover_crash(df_index: pd.DatetimeIndex, T_days: int, crash_windows: list[dict], seed: int):
-    """
-    Try to choose a start_idx so that [start_idx, start_idx+T_days) overlaps at least
-    one crash window. Returns None if impossible.
-    """
-    if crash_windows is None or len(crash_windows) == 0:
-        return None
-    idx = pd.DatetimeIndex(df_index).sort_values()
-    T_total = len(idx)
-    max_start = int(T_total - T_days - 1)
-    if max_start <= 0:
-        return None
+def plot_wealth_overlay_grid(
+    df_sel: pd.DataFrame,
+    returns_log: np.ndarray,
+    cfg,
+    *,
+    policy_A2,
+    policy_B2,
+    target_ann: float,
+    T_days: int,
+    lam_cost: float,
+    rebalance_every: int,
+    n_windows: int = 4,
+    seed: int = 2025,
+    start_idx_list=None,
+    log_scale: bool = True,
+    mv_solver: str = "OSQP",
+    qp_solver: str = "OSQP",
+    out_png: str | None = None,
+):
+    starts = make_start_indices(
+        T_total=returns_log.shape[0],
+        T_days=T_days,
+        n_windows=n_windows,
+        seed=seed,
+        start_idx_list=start_idx_list,
+    )
+    n = len(starts)
+    ncols = 1 if n == 1 else 2
+    nrows = int(math.ceil(n / ncols))
 
-    candidates = []
-    for cw in crash_windows:
-        s = pd.Timestamp(cw["start"])
-        e = pd.Timestamp(cw["end"])
-        j0 = int(idx.searchsorted(s, side="left"))
-        j1 = int(idx.searchsorted(e, side="right")) - 1
-        if j1 < 0 or j0 >= T_total:
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(13, 4.7 * nrows), squeeze=False)
+    for k, start_idx in enumerate(starts):
+        r = k // ncols
+        c = k % ncols
+        ax = axes[r][c]
+
+        dates = pd.DatetimeIndex(df_sel.index[start_idx : start_idx + T_days])
+
+        rs_mv_d = run_episode_MV_daily_frictionless_hist(
+            cfg, np.eye(cfg.N_ASSETS), returns_log, target_ann,
+            start_idx=start_idx, T_days=T_days, seed=int(seed) + k,
+            mv_solver=mv_solver, infeasible_policy="skip",
+        )
+        rs_mv_m = run_episode_MV_monthly_cost_hist(
+            cfg, np.eye(cfg.N_ASSETS), returns_log, lam_cost, target_ann,
+            start_idx=start_idx, T_days=T_days, rebalance_every=rebalance_every, seed=int(seed) + k,
+            mv_solver=mv_solver, infeasible_policy="skip",
+        )
+        rs_a2 = run_episode_RL_band_A2_hist(
+            cfg, np.eye(cfg.N_ASSETS), returns_log, policy_A2, lam_cost, target_ann,
+            start_idx=start_idx, T_days=T_days, seed=int(seed) + k, device=cfg.device,
+            mv_solver=mv_solver, infeasible_policy="skip",
+        )
+        rs_b2 = run_episode_RL_band_B2_hist(
+            cfg, np.eye(cfg.N_ASSETS), returns_log, policy_B2, lam_cost, target_ann,
+            start_idx=start_idx, T_days=T_days, seed=int(seed) + k, device=cfg.device,
+            mv_solver=mv_solver, qp_solver=qp_solver, infeasible_policy="skip",
+        )
+
+        curves = []
+        if rs_mv_d is not None: curves.append(("MV daily (frictionless)", rs_mv_d))
+        if rs_mv_m is not None: curves.append(("MV monthly (cost)", rs_mv_m))
+        if rs_a2 is not None:   curves.append(("RL A2 (band)", rs_a2))
+        if rs_b2 is not None:   curves.append(("RL B2 (rot-box)", rs_b2))
+
+        if not curves:
+            ax.set_title(f"start_idx={start_idx} (no feasible runs)")
+            ax.axis("off")
             continue
-        j0 = max(0, min(j0, T_total - 1))
-        j1 = max(0, min(j1, T_total - 1))
-        # overlap condition: start <= j1 AND start+T_days-1 >= j0
-        lo = max(0, j0 - (T_days - 1))
-        hi = min(max_start, j1)
-        if lo <= hi:
-            candidates.append((lo, hi))
 
-    if not candidates:
-        return None
+        for label, rs in curves:
+            W = wealth_from_rsimple(rs, 100.0)
+            dates_r = dates[:len(rs)]
+            dates_w = dates_r.insert(0, dates_r[0])
+            y = safe_log_wealth(W) if log_scale else W
+            ax.plot(dates_w, y, label=label)
 
-    rng = np.random.default_rng(int(seed))
-    lo, hi = candidates[int(rng.integers(0, len(candidates)))]
-    return int(rng.integers(lo, hi + 1))
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Window {k+1}/{n} | start_idx={start_idx} | target={target_ann:.3f}")
+        ax.set_ylabel("log(wealth)" if log_scale else "wealth (base=100)")
+        ax.legend(fontsize=8)
 
-def _normalize_episode_output(out):
-    """
-    Normalize episode runner outputs to:
-      rs: np.ndarray (T,)
-      trade_stats: dict or None
-    Accepts:
-      - None
-      - np.ndarray / list (rs)
-      - dict with keys {"rs", "stats"} (your current convention)
-    """
-    if out is None:
-        return None, None
-    if isinstance(out, dict):
-        rs = out.get("rs", None)
-        st = out.get("stats", None)
-        return rs, st
-    # assume array-like returns
-    return out, None
+    # disable unused
+    for kk in range(n, nrows * ncols):
+        rr = kk // ncols
+        cc = kk % ncols
+        axes[rr][cc].axis("off")
 
-def _pick_starts_with_at_least_one_crash(
-     idx: pd.DatetimeIndex,
-     *,
-     T_days: int,
-     n_windows: int,
-     rng: np.random.Generator,
-     crash_windows: list[dict] | None,
- ):
-     """
-     Pick start indices so that at least one window overlaps at least one crash window (if possible).
-     Overlap condition: [start, start+T_days-1] intersects [crash_start, crash_end]
-     """
-     idx = pd.DatetimeIndex(idx)
-     T_total = len(idx)
-     Tmax = int(T_total - T_days - 1)
-     if Tmax <= 0:
-         raise ValueError("Not enough data for wealth windows.")
-
-     starts = []
-     if crash_windows:
-         for cw in crash_windows:
-             s = pd.Timestamp(cw["start"])
-             e = pd.Timestamp(cw["end"])
-             if s > idx[-1] or e < idx[0]:
-                 continue
-             # indices (clip into [0, T_total-1])
-             s_i = int(idx.searchsorted(s, side="left"))
-             e_i = int(idx.searchsorted(e, side="right")) - 1
-             s_i = max(0, min(s_i, T_total - 1))
-             e_i = max(0, min(e_i, T_total - 1))
-             # overlap window start range:
-             # start <= e_i and start + T_days - 1 >= s_i
-             lo = max(0, s_i - (T_days - 1))
-             hi = min(Tmax, e_i)
-             if lo <= hi:
-                 starts.append(int(rng.integers(lo, hi + 1)))
-                 break  # "at least one crash-including window" requirement
-
-     # fill remaining randomly (unique-ness is optional; keep simple)
-     while len(starts) < int(n_windows):
-         starts.append(int(rng.integers(0, Tmax + 1)))
-     return starts[: int(n_windows)]
+    fig.suptitle(
+        f"Wealth Overlay | target={target_ann:.3f} | {'LOG' if log_scale else 'LEVEL'} | n_windows={n}",
+        y=0.995,
+    )
+    plt.tight_layout()
+    if out_png is not None:
+        Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_png, dpi=160)
+    plt.show()
 
 # ============================================================
 # 6) Plotting
@@ -1463,9 +1013,8 @@ def plot_frontier(res, targets, title):
 
 def plot_frontier_save(res, targets, title, out_png: str):
     strategies = [
-        #("MV_daily_frictionless", "o"),
+        ("MV_daily_frictionless", "o"),
         ("MV_monthly_cost", "s"),
-        ("EW_monthly_cost", "D"),
         ("RL_band_A2", "^"),
         ("RL_band_B2", "X"),
     ]
@@ -1494,9 +1043,9 @@ def _fmt_stats_box(stats: Dict[str, float]) -> str:
     if stats is None or any(np.isnan(stats.get(k, np.nan)) for k in ["ann_mean", "ann_vol"]):
         return "N/A"
     return (
-        #f"TotRet:  {stats['ret']*100:6.2f}%\n"
+        f"TotRet:  {stats['ret']*100:6.2f}%\n"
         f"AnnRet:  {stats['ann_mean']*100:6.2f}%\n"
-        #f"AnnVol:  {stats['ann_vol']*100:6.2f}%\n"
+        f"AnnVol:  {stats['ann_vol']*100:6.2f}%\n"
         f"Sharpe:  {stats['sharpe']:6.2f}\n"
         f"Sortino: {stats['sortino']:6.2f}\n"
         f"MaxDD:   {stats['maxdd']*100:6.2f}%"
@@ -1544,7 +1093,6 @@ def plot_wealth_overlay_grid_with_stats(
     # gamma: pass precomputed (T_window, K) for the *whole eval slice* if you have it
     gamma_full: Optional[np.ndarray] = None,
     gamma_dates: Optional[pd.DatetimeIndex] = None,
-    burnin_steps: int = 0,
 ):
     """
     Makes a grid of wealth overlays (n_windows windows), and:
@@ -1564,24 +1112,9 @@ def plot_wealth_overlay_grid_with_stats(
     if T_max_start <= 0:
         raise ValueError("Not enough data for wealth windows.")
     starts = [int(rng.integers(0, T_max_start)) for _ in range(int(n_windows))]
-    # force at least one window to overlap a crash window (if feasible)
-    forced = _pick_start_idx_to_cover_crash(df_sel.index, T_days, crash_windows, seed=base_seed)
-    if forced is not None and len(starts) > 0:
-        starts[0] = int(forced)
-    #starts = [int(rng.integers(0, T_max_start)) for _ in range(int(n_windows))]
-    # choose windows (ensure at least one overlaps a crash window if possible)
-    #rng = np.random.default_rng(int(base_seed))
-    #starts = _pick_starts_with_at_least_one_crash(
-    #    df_sel.index,
-    #    T_days=int(T_days),
-    #    n_windows=int(n_windows),
-    #    rng=rng,
-    #    crash_windows=crash_windows,
-    #)
 
     # prepare crash stats rows
     crash_rows: List[Dict[str, Any]] = []
-    wealth_turn_rows: List[Dict[str, Any]] = []
 
     # subplot grid
     nW = int(n_windows)
@@ -1595,113 +1128,61 @@ def plot_wealth_overlay_grid_with_stats(
         win_df = df_sel.iloc[start_idx:start_idx + T_days]
         dates = pd.DatetimeIndex(win_df.index)
         # --- run strategies (rsimple) ---
-        out_mv_daily = run_episode_MV_daily_frictionless_hist(
+        rs_mv_daily = run_episode_MV_daily_frictionless_hist(
             cfg, np.eye(cfg.N_ASSETS), returns_log, target_ann,
             start_idx=start_idx, T_days=T_days, seed=base_seed + i,
             mv_solver="OSQP", infeasible_policy="fallback",
         )
-        out_mv_monthly = run_episode_MV_monthly_cost_hist(
+        rs_mv_monthly = run_episode_MV_monthly_cost_hist(
             cfg, np.eye(cfg.N_ASSETS), returns_log, lam_cost, target_ann,
             start_idx=start_idx, T_days=T_days, rebalance_every=rebalance_every, seed=base_seed + i,
             mv_solver="OSQP", infeasible_policy="fallback",
         )
-        out_ew_monthly = run_episode_EW_monthly_cost_hist(
-            cfg, np.eye(cfg.N_ASSETS), returns_log, lam_cost,
-            start_idx=start_idx, T_days=T_days, rebalance_every=rebalance_every, seed=base_seed + i,
-        )
-        out_a2 = run_episode_RL_band_A2_hist(
+        rs_a2 = run_episode_RL_band_A2_hist(
             cfg, np.eye(cfg.N_ASSETS), returns_log, policy_A2, lam_cost, target_ann,
             start_idx=start_idx, T_days=T_days, seed=base_seed + i,
             device=cfg.device, mv_solver="OSQP", infeasible_policy="fallback",
         )
-        out_b2 = run_episode_RL_band_B2_hist(
+        rs_b2 = run_episode_RL_band_B2_hist(
             cfg, np.eye(cfg.N_ASSETS), returns_log, policy_B2, lam_cost, target_ann,
             start_idx=start_idx, T_days=T_days, seed=base_seed + i,
             device=cfg.device, mv_solver="OSQP", qp_solver="OSQP", infeasible_policy="fallback",
         )
-        rs_mv_daily, st_mv_daily   = _normalize_episode_output(out_mv_daily)
-        rs_mv_monthly, st_mv_monthly = _normalize_episode_output(out_mv_monthly)
-        rs_ew_monthly, st_ew_monthly = _normalize_episode_output(out_ew_monthly)
-        rs_a2, st_a2 = _normalize_episode_output(out_a2)
-        rs_b2, st_b2 = _normalize_episode_output(out_b2)
 
         series = [
-            #("MV_daily",   rs_mv_daily,   st_mv_daily),
-            ("MV_monthly", rs_mv_monthly, st_mv_monthly),
-            ("EW_monthly", rs_ew_monthly, st_ew_monthly),
-            ("RL_A2",      rs_a2,         st_a2),
-            ("RL_B2",      rs_b2,         st_b2),
+            ("MV_daily", rs_mv_daily),
+            ("MV_monthly", rs_mv_monthly),
+            ("RL_A2", rs_a2),
+            ("RL_B2", rs_b2),
         ]
 
         # plot wealth & stats box (aggregate for full window)
         y_max = None
         box_lines = []
-        for name, rs, trade_st in series:
-            if rs is None or len(rs) == 0:
+        for name, rs in series:
+            if rs is None:
                 continue
-            # rs can be np.ndarray (MV_daily) or dict (others)
-            if isinstance(rs, dict):
-                rs_use = rs["rs"]
-                stats_use = rs.get("stats", {})
-            else:
-                rs_use = rs
-                stats_use = {}
-            dates_p, W_p = _burnin_slice_for_plot(dates, rs, burnin_steps, w0=100.0, renormalize=True)
-            y = safe_log_wealth(W_p) if log_scale else W_p
-            ax.plot(dates_p.insert(0, dates_p[0]), y, label=name)
-            #W = wealth_from_rsimple(rs, 100.0)
-            #y = safe_log_wealth(W) if log_scale else W
-            #ax.plot(dates.insert(0, dates[0]), y, label=name)  # align W length = T+1
+            W = wealth_from_rsimple(rs, 100.0)
+            y = safe_log_wealth(W) if log_scale else W
+            ax.plot(dates.insert(0, dates[0]), y, label=name)  # align W length = T+1
             y_max = float(np.max(y)) if y_max is None else float(max(y_max, np.max(y)))
-            rs_use_eval = _burnin_slice_rs(rs_use, burnin_steps)
-            st = perf_stats_from_rsimple(rs_use_eval, dt=float(cfg.dt_day))           
-            #st = perf_stats_from_rsimple(rs_use, dt=float(cfg.dt_day))
+            st = perf_stats_from_rsimple(rs, dt=float(cfg.dt_day))
             box_lines.append(f"[{name}]\n{_fmt_stats_box(st)}")
-            # wealth-mode turnover/cost logger (match turnover_cost_stats.csv columns)
-            if isinstance(trade_st, dict) and len(trade_st) > 0:
-                 wealth_turn_rows.append(dict(
-                     name=name,
-                     target=float(target_ann),
-                     seed=int(base_seed + i),
-                     inside_rate=float(trade_st.get("inside_rate", np.nan)),
-                     turnover_mean=float(trade_st.get("turnover_mean", np.nan)),
-                     sold_total_sum=float(trade_st.get("sold_total_sum", np.nan)),
-                     cost_drag_sum=float(trade_st.get("cost_drag_sum", np.nan)),
-                     steps=int(trade_st.get("steps", len(rs))),
-                     # optional but helpful for debugging:
-                     window=int(i),
-                     start=str(dates[0].date()) if len(dates) else "",
-                     end=str(dates[-1].date()) if len(dates) else "",
-                 ))
 
             # crash-window stats
             for cw in crash_windows:
-                # only add if overlap is non-empty
-                rsub = _slice_by_dates(dates, rs_use, cw["start"], cw["end"])
-                if rsub.size == 0:
-                    continue
-                if rsub is None or len(rsub) == 0:
-                     continue
+                rsub = _slice_by_dates(dates, rs, cw["start"], cw["end"])
                 st_cw = perf_stats_from_rsimple(rsub, dt=float(cfg.dt_day))
                 crash_rows.append(dict(
-                    window=int(i),
+                    window=i,
                     start=str(dates[0].date()) if len(dates) else "",
                     end=str(dates[-1].date()) if len(dates) else "",
                     strategy=name,
                     crash_name=cw["name"],
                     crash_start=cw["start"],
                     crash_end=cw["end"],
-                    # attach trade/band stats if available (same format as turnover_cost_stats.csv)
-                    **{k: stats_use.get(k, np.nan) for k in [
-                        "steps","inside_rate","trigger_rate",
-                        "turnover_mean","sold_total_sum","cost_drag_sum",
-                        "avg_distance_to_band","avg_action_norm",
-                        "width_mean","width_median","width_min","width_max",
-                        "mstar_shift",
-                    ]},
-                     **st_cw,
-                 ))
-
+                    **st_cw,
+                ))
         # crash highlights
         for cw in crash_windows:
             s = pd.Timestamp(cw["start"])
@@ -1738,27 +1219,10 @@ def plot_wealth_overlay_grid_with_stats(
     plt.savefig(out_png, dpi=170)
     plt.close(fig)
 
-    # crash stats CSV (same file name/columns convention)
+    # crash stats CSV
     if crash_rows:
         df_c = pd.DataFrame(crash_rows)
-        # stable column order (match turnover_cost_stats + perf stats)
-        col_order = [
-            "window","start","end",
-            "strategy","crash_name","crash_start","crash_end",
-            "steps","inside_rate","trigger_rate",
-            "turnover_mean","sold_total_sum","cost_drag_sum",
-            "avg_distance_to_band","avg_action_norm",
-            "width_mean","width_median","width_min","width_max",
-            "mstar_shift",
-            "ret","ann_mean","ann_vol","sharpe","sortino","maxdd",
-        ]
-        df_c = df_c[[c for c in col_order if c in df_c.columns]]
         df_c.to_csv(Path(out_dir) / "crash_window_stats.csv", index=False)
-
-    # wealth-mode turnover/cost CSV (same columns as turnover_cost_stats.csv + window/start/end)
-    if wealth_turn_rows:
-        df_t = pd.DataFrame(wealth_turn_rows)
-        df_t.to_csv(Path(out_dir) / "turnover_cost_stats_wealth.csv", index=False)
 
 def summaries_to_frames(resA, resG, shA, shG, targets):
     rowsA, rowsG = [], []
@@ -1804,107 +1268,7 @@ def parse_crash_windows(s: str):
         )
     return windows
 
-# ==========================================================
-# Turnover / cost logger (shared across strategies)
-# ==========================================================
-def _get_weights_and_wealth(env):
-    """
-    Best-effort extraction of (w, Y) from env.
-    Works for envs that expose S (risky holdings) and C (cash).
-    Returns (None, None) if unavailable.
-    """
-    if hasattr(env, "S") and hasattr(env, "C"):
-        S = np.asarray(getattr(env, "S"), float).reshape(-1)
-        C = float(getattr(env, "C"))
-        Y = float(S.sum() + C)
-        w = S / (Y + 1e-30)
-        return w, Y
-    return None, None
 
-
-def _trade_stats_step(env, w_pre, Y_prev, lam_scalar):
-    """
-    Compute per-step turnover / sold_total / cost_drag in a solver-agnostic way.
-
-    turnover: 0.5 * ||w_post - w_pre||_1
-    sold_total: env.sold_total_last があればそれ、無ければ sell-only を仮定して weights 差分から近似
-    cost_drag: (1-lam) * sold_total / Y_prev
-    did_trade: turnover > tiny
-    """
-    w_post = getattr(env, "w_post_trade", None)
-    if w_post is None:
-        w_post, _ = _get_weights_and_wealth(env)
-    if w_post is None:
-        return dict(turnover=np.nan, sold_total=np.nan, cost_drag=np.nan, did_trade=False)
-
-    w_post = np.asarray(w_post, float).reshape(-1)
-    w_pre  = np.asarray(w_pre,  float).reshape(-1)
-
-    turnover = 0.5 * float(np.sum(np.abs(w_post - w_pre)))
-
-    sold_total = getattr(env, "sold_total_last", None)
-    if sold_total is None or (isinstance(sold_total, float) and (not np.isfinite(sold_total))):
-         sold_total = float(Y_prev) * float(np.sum(np.maximum(w_pre - w_post, 0.0)))
-
-    kappa = max(0.0, 1.0 - float(lam_scalar))
-    cost_drag = kappa * float(sold_total) / max(float(Y_prev), 1e-30)
-
-    return dict(
-        turnover=float(turnover),
-        sold_total=float(sold_total),
-        cost_drag=float(cost_drag),
-        did_trade=bool(turnover > 1e-12),
-    )
-
-def _distance_to_band_axis(w, A, B):
-    """L1 distance to the axis-aligned box [A,B] (0 if inside)."""
-    w = np.asarray(w, float).reshape(-1)
-    A = np.asarray(A, float).reshape(-1)
-    B = np.asarray(B, float).reshape(-1)
-    return float(np.sum(np.maximum(A - w, 0.0) + np.maximum(w - B, 0.0)))
-
-
-def _distance_to_band_rotated(w, m, U, b_z):
-    """L1 distance to rotated box {|U^T(w-m)| <= b_z} (0 if inside)."""
-    w = np.asarray(w, float).reshape(-1)
-    m = np.asarray(m, float).reshape(-1)
-    U = np.asarray(U, float)
-    b_z = np.asarray(b_z, float).reshape(-1)
-    z = U.T @ (w - m)
-    return float(np.sum(np.maximum(np.abs(z) - b_z, 0.0)))
-
-
-def _width_stats(width_vec):
-    width_vec = np.asarray(width_vec, float).reshape(-1)
-    if width_vec.size == 0:
-        return dict(width_mean=np.nan, width_median=np.nan, width_min=np.nan, width_max=np.nan)
-    return dict(
-        width_mean=float(np.mean(width_vec)),
-        width_median=float(np.median(width_vec)),
-        width_min=float(np.min(width_vec)),
-        width_max=float(np.max(width_vec)),
-    )
-
-def _finalize_stats(*, steps, inside_cnt, outside_cnt, trigger_cnt,
-                    turnover_sum, sold_sum, cost_drag_sum,
-                    dist_sum, action_sum, width_all, mstar_shift=0.0):
-    steps = int(steps)
-    denom_io = max(1, inside_cnt + outside_cnt)
-    denom_s  = max(1, steps)
-    out = dict(
-        steps=steps,
-        inside_rate=float(inside_cnt / denom_io),
-        trigger_rate=float(trigger_cnt / denom_s),
-        turnover_mean=float(turnover_sum / denom_s),
-        sold_total_sum=float(sold_sum),
-        cost_drag_sum=float(cost_drag_sum),
-        avg_distance_to_band=float(dist_sum / denom_s),
-        avg_action_norm=float(action_sum / denom_s),
-        mstar_shift=float(mstar_shift),
-    )
-    out.update(_width_stats(width_all))
-    return out
- 
 # ============================================================
 # 7) MAIN
 # ============================================================
@@ -1917,10 +1281,8 @@ if __name__ == "__main__":
     ap.add_argument("--eval_start", type=str, default=None)
     ap.add_argument("--eval_end", type=str, default=None)
     ap.add_argument("--T_days", type=int, default=1260)
-    ap.add_argument("--n_eps", type=int, default=50)
+    ap.add_argument("--n_eps", type=int, default=30)
     ap.add_argument("--dt", type=float, default=1.0/252)
-    ap.add_argument("--burnin_days", type=int, default=21,
-                    help="Exclude first N steps from performance stats and wealth plots (evaluation only).")
 
     # regime json for filtering gamma_t
     ap.add_argument("--regime_json", type=str, default=None,
@@ -1943,6 +1305,9 @@ if __name__ == "__main__":
     ap.add_argument("--wealth_target", type=float, default=0.06)
     ap.add_argument("--wealth_windows", type=int, default=4)
     ap.add_argument("--wealth_log", action="store_true")
+
+    ap.add_argument("--run_name", type=str, default=None)
+    ap.add_argument("--out_dir", type=str, default="outputs/historical")
 
 
     args = ap.parse_args()
@@ -1990,7 +1355,8 @@ if __name__ == "__main__":
     # ============================================================
     # 8) Frontier evaluation (HISTORICAL)
     # ============================================================
-    targets = np.linspace(0.02, 0.10, 15)   # 2% ～ 10% 年率ターゲット
+    #targets = np.linspace(0.02, 0.10, 9)   # 2% ～ 10% 年率ターゲット
+    targets = np.array([float(args.wealth_target)], dtype=float)
     lam_cost = 0.99
     rebalance_every = 21
 
@@ -2006,29 +1372,46 @@ if __name__ == "__main__":
         rebalance_every=rebalance_every,
         T_days=args.T_days,
         base_seed=2025,
-        outdir=str(Path("outputs/historical")),
-        burnin_steps=int(args.burnin_days)
     )
 
-    outdir = Path("outputs/historical")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = args.run_name or f"hist_{ts}_lam{lam_cost:.3f}"
+    outdir = Path(args.out_dir) / run_name
     outdir.mkdir(parents=True, exist_ok=True)
+
+    #outdir = Path("outputs/historical")
+    #outdir.mkdir(parents=True, exist_ok=True)
 
     # ============================================================
     # 9) Save frontier plots
     # ============================================================
-    plot_frontier_save(
-        resA,
-        targets,
-        title="Historical Frontier (Arithmetic)",
-        out_png=str(outdir / "frontier_arithmetic.png"),
-    )
+    #plot_frontier_save(resA,targets,title="Historical Frontier (Arithmetic)",out_png=str(outdir / "frontier_arithmetic.png"),)
 
-    plot_frontier_save(
-        resG,
-        targets,
-        title="Historical Frontier (Geometric)",
-        out_png=str(outdir / "frontier_geometric.png"),
-    )
+    #plot_frontier_save(resG,targets,title="Historical Frontier (Geometric)",out_png=str(outdir / "frontier_geometric.png"),)
+
+    # 9) Save realized mean-vol scatter (arith & geom)
+    def plot_realized_scatter(raw, targets, title, out_png):
+        strategies = ["MV_daily_frictionless", "MV_monthly_cost", "RL_band_A2", "RL_band_B2"]
+        plt.figure(figsize=(8, 6))
+        for s in strategies:
+            pts = []
+            for t in targets:
+                pts += [d["arith"] for d in raw[s][t]]  # (mean, vol)
+            if len(pts) == 0:
+                continue
+            P = np.array(pts, float)
+            plt.scatter(P[:, 1], P[:, 0], s=18, alpha=0.45, label=s)  # x=vol, y=mean
+        plt.xlabel("Annualized Volatility (realized)")
+        plt.ylabel("Annualized Mean (realized)")
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+        plt.legend(fontsize=9)
+        plt.tight_layout()
+        Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_png, dpi=160)
+        plt.close()
+
+    plot_realized_scatter(raw, targets, "Realized Mean-Vol Scatter (Arithmetic)", str(outdir / "scatter_arithmetic.png"))
 
     # also save tables
     dfA, dfG = summaries_to_frames(resA, resG, shA, shG, targets)
@@ -2055,11 +1438,10 @@ if __name__ == "__main__":
             T_days=args.T_days,
             n_windows=args.wealth_windows,
             base_seed=2025,
-            out_png="outputs/historical/wealth_overlay.png",
-            out_dir="outputs/historical",
+            out_png="outputs/wealth_overlay.png",
+            out_dir="outputs",
             log_scale=args.wealth_log,
             crash_windows=parse_crash_windows(args.crash_windows),
-            burnin_steps=int(args.burnin_days)
         )
 
     # ============================================================
