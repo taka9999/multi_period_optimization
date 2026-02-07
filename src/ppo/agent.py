@@ -76,11 +76,13 @@ class JointBandPolicy(nn.Module):
       - widths s in (0,1)^N
     ログ確率は“事前の独立 Sigmoid 変数”に対して計算し、射影は stop-grad で適用（実務で安定）。
     """
-    def __init__(self, N:int, d_model:int=128, nlayers:int=2, nhead:int=4, use_cash_softmax:bool=False, global_dim:int=4):
+    def __init__(self, N:int, d_model:int=128, nlayers:int=2, nhead:int=4, use_cash_softmax:bool=False, global_dim:int=4, per_dim:int=5):
         super().__init__()
         self.N = N
         self.global_dim = int(global_dim)
-        self.body = JointTransformerBody(N, per_dim=5, global_dim=self.global_dim, d_model=d_model, nhead=nhead, nlayers=nlayers)
+        self.per_dim = int(per_dim)
+        #self.body = JointTransformerBody(N, per_dim=5, global_dim=self.global_dim, d_model=d_model, nhead=nhead, nlayers=nlayers)
+        self.body = JointTransformerBody(N, per_dim=self.per_dim, global_dim=self.global_dim, d_model=d_model, nhead=nhead, nlayers=nlayers)
         self.head_m = nn.Linear(d_model, 1)   # per-asset
         self.head_s = nn.Linear(d_model, 1)
         self.log_std_m = nn.Parameter(torch.tensor(-0.7))
@@ -95,11 +97,13 @@ class JointBandPolicy(nn.Module):
         s_mu = self.head_s(tok_out).squeeze(-1)  # [B,N]
         return m_mu, s_mu
 
-    @staticmethod
-    def _build_tokens(obs: torch.Tensor, N: int, global_dim: int,):
+    #@staticmethod
+    def _build_tokens_old(obs: torch.Tensor, N: int, global_dim: int,):
         B = obs.size(0)
-        per  = obs[:, :N*5].view(B, N, 5).contiguous()
-        glob = obs[:, N*5:].contiguous()
+        #per  = obs[:, :N*5].view(B, N, 5).contiguous()
+        #glob = obs[:, N*5:].contiguous()
+        per  = obs[:, :N*self.per_dim].view(B, N, self.per_dim).contiguous()
+        glob = obs[:, N*self.per_dim:].contiguous()
         # tolerate mismatch: crop/pad to global_dim
         if glob.size(1) > global_dim:
             glob = glob[:, -global_dim:]
@@ -108,10 +112,31 @@ class JointBandPolicy(nn.Module):
                               device=glob.device, dtype=glob.dtype)
             glob = torch.cat([glob, pad], dim=1)
         return per, glob
+    def _build_tokens(self, obs: torch.Tensor):
+        """
+        obs = [ per_asset (N*per_dim), global (global_dim) ] を想定
+        """
+        B = obs.size(0)
+        N = self.N
+        per_dim = self.per_dim
+        global_dim = self.global_dim
+
+        per = obs[:, :N * per_dim].view(B, N, per_dim).contiguous()
+        glob = obs[:, N * per_dim:].contiguous()
+
+        # tolerate mismatch: crop/pad to global_dim
+        if glob.size(1) > global_dim:
+            glob = glob[:, -global_dim:]
+        elif glob.size(1) < global_dim:
+            pad = torch.zeros((B, global_dim - glob.size(1)),
+                            device=glob.device, dtype=glob.dtype)
+            glob = torch.cat([glob, pad], dim=1)
+        return per, glob
 
     def sample(self, obs: torch.Tensor, deterministic: bool=False):
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        #per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs)
         cls_out, tok_out = self.body(per, glob)           # [B,d], [B,N,d]
         m_mu, s_mu = self.forward_heads(cls_out, tok_out)
 
@@ -169,7 +194,8 @@ class JointBandPolicy(nn.Module):
         戻り値: s_t(0,1), logp_s(合計), s_pre(0,1)  ※ logprob_s_only と同じ前提
         """
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        #per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs)
         cls_out, tok_out = self.body(per, glob)
 
         s_mu = self.head_s(tok_out).squeeze(-1)           # [B,N]
@@ -188,7 +214,8 @@ class JointBandPolicy(nn.Module):
         m の決定論出力は self.sample() と完全に同じ射影規則に従う。
         """
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        #per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs)
         cls, tok  = self.body(per, glob)
 
         # --- m を決定論で ---
@@ -217,7 +244,8 @@ class JointBandPolicy(nn.Module):
         - use_cash_softmax=False: m_pre は (0,1)（sigmoid結果）を渡す。
         """
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        #per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs)
         cls_out, tok_out = self.body(per, glob)
         m_mu = self.head_m(tok_out).squeeze(-1)           # [B,N]
         std_m = torch.exp(self.log_std_m)
@@ -235,7 +263,8 @@ class JointBandPolicy(nn.Module):
 
     def logprob_s_only(self, obs: torch.Tensor, s_pre: torch.Tensor) -> torch.Tensor:
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        #per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs)
         cls_out, tok_out = self.body(per, glob)
         s_mu = self.head_s(tok_out).squeeze(-1)          # [B,N]
         std_s = torch.exp(self.log_std_s)
@@ -248,7 +277,8 @@ class JointBandPolicy(nn.Module):
     
     def logprob(self, obs: torch.Tensor, m_pre: torch.Tensor, s_pre: torch.Tensor):
         B = obs.size(0); N = self.N
-        per, glob = self._build_tokens(obs, N, self.global_dim)
+        #per, glob = self._build_tokens(obs, N, self.global_dim)
+        per, glob = self._build_tokens(obs)
         cls_out, tok_out = self.body(per, glob)
         m_mu, s_mu = self.forward_heads(cls_out, tok_out)
         std_m = torch.exp(self.log_std_m); std_s = torch.exp(self.log_std_s)
@@ -274,11 +304,12 @@ class JointBandPolicy(nn.Module):
         return logp_m + logp_s
 
 class ValueNetCLS(nn.Module):
-    def __init__(self, N:int, d_model:int=128, nlayers:int=2, nhead:int=4, global_dim:int=4):
+    def __init__(self, N:int, d_model:int=128, nlayers:int=2, nhead:int=4, global_dim:int=4, per_dim:int=5):
         super().__init__()
         self.N = int(N)
         self.global_dim = int(global_dim)
-        self.body = JointTransformerBody(N, per_dim=5, global_dim = self.global_dim,d_model=d_model, nhead=nhead, nlayers=nlayers)
+        self.per_dim = int(per_dim)
+        self.body = JointTransformerBody(N, per_dim=self.per_dim, global_dim = self.global_dim,d_model=d_model, nhead=nhead, nlayers=nlayers)
         self.head = nn.Sequential(
             nn.Linear(d_model, d_model), nn.GELU(),
             nn.Linear(d_model, 1)
@@ -286,8 +317,8 @@ class ValueNetCLS(nn.Module):
     def forward(self, obs: torch.Tensor):
         B = obs.size(0)
         N = self.N
-        per = obs[:, :N*5].view(B, N, 5).contiguous()
-        glob = obs[:, N*5:].contiguous()
+        per = obs[:, :N*self.per_dim].view(B, N, self.per_dim).contiguous()
+        glob = obs[:, N*self.per_dim:].contiguous()
         if glob.size(1) > self.global_dim:
             glob = glob[:, -self.global_dim:]
         elif glob.size(1) < self.global_dim:

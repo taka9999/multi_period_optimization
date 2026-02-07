@@ -671,7 +671,9 @@ def rollout_joint(
                 #b = 0.95 * s_np * g * minm
                 # HJB/QVI-inspired correlation-aware width prior (box approximation).
                 # In this codebase, `lam` is the sell-proceeds wedge in (0,1]; proportional sell cost is kappa = 1-lam.
-                lam_scalar = float(obs[N*5 + 0])
+                per_dim = int(getattr(gcfg_ep, "PER_ASSET_DIM", 5))
+                lam_scalar = float(obs[N*per_dim + 0])
+                #lam_scalar = float(obs[N*5 + 0])
                 delta = compute_delta_box(
                     w_star=m_star,
                     Cov=env.Cov,
@@ -693,7 +695,7 @@ def rollout_joint(
                 b_zero_list.append(float(np.mean(b_arr <= 1e-12)))
 
             # ===== DEBUG: 最初の episode & 最初の step だけ =====
-            if k == 0 and t == 0:
+            if stage == 2 and k == 0 and t == 0:
                 print("[dbg] gamma =", float(getattr(gcfg_ep, "RISK_GAMMA", 0.0)))
                 print("[dbg] delta(min/med/max) =",
                     float(delta.min()),

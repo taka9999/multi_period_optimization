@@ -11,7 +11,7 @@ import torch.optim as optim
 from src.ppo.update import ppo_update_joint
 from src.ppo.agent import JointBandPolicy, ValueNetCLS, PPOConfig
 
-from src.utils.training_utils import freeze_centers_in_stage2
+from src.utils.training_utils import freeze_width_head_in_stage1,freeze_centers_in_stage2
 from src.utils.rlopt_helpers import build_corr_from_pairs, build_cov
 
 from src.regime_gbm.gbm_env import globalsetting
@@ -154,11 +154,20 @@ def main():
     #   - Env appends soft regime prob gamma (len K) to obs global features.
     #   - Networks must be created with global_dim = 4 + K, and PPOConfig must match.
     # ============================================================
-    if globalcfg.REGIME_GAMMA_ON_OBS:
-        K = int(len(regimes))
-        cfg.global_dim = 4 + K
-    else:
-        cfg.global_dim = 4
+    #if globalcfg.REGIME_GAMMA_ON_OBS:
+    #    K = int(len(regimes))
+    #    cfg.global_dim = 4 + K
+    #else:
+    #    cfg.global_dim = 4
+    cfg.per_asset_dim = int(getattr(globalcfg, "PER_ASSET_DIM", 5))
+
+    roll_global_dim = 0
+    if getattr(globalcfg, "ROLL_COV_SUMMARY_ON_OBS", False):
+        roll_global_dim = 2 + int(getattr(globalcfg, "ROLL_TOP_EIGS", 2))
+
+    K = int(len(regimes)) if getattr(globalcfg, "REGIME_GAMMA_ON_OBS", False) else 0
+    cfg.global_dim = 4 + roll_global_dim + K
+
 
 
     # env factory to inject into rollout
@@ -180,17 +189,34 @@ def main():
         N, d_model=128, nlayers=2, nhead=4,
         use_cash_softmax=True,
         global_dim=cfg.global_dim,
+        per_dim=cfg.per_asset_dim,
     ).to(globalcfg.device)
-    value  = ValueNetCLS(
-        N, d_model=128, nlayers=2, nhead=4,
-        global_dim=cfg.global_dim,
-    ).to(globalcfg.device)
+    value  = ValueNetCLS(N, d_model=128, nlayers=2, nhead=4,global_dim=cfg.global_dim,per_dim=cfg.per_asset_dim,).to(globalcfg.device)
 
     opt_pi = optim.Adam(policy.parameters(), lr=cfg.lr_actor)
     opt_v  = optim.Adam(value.parameters(),  lr=cfg.lr_critic)
 
     # -------------------------
-    # Stage 2 only (same as your notebook)
+    #  Stage 1: frictionless (λ=1.0, tiny width)
+    # -------------------------
+    print("[Stage 1] warmup (beta -> m)")
+    policy.use_cash_softmax = False
+    freeze_width_head_in_stage1(policy)
+    for it in range(6):
+        batch = rollout_joint(policy, value, cfg,
+                          gcfg=globalcfg,
+                          lam_choices=[1.0],
+                          target_choices=target_choices,
+                          stage=1,
+                          batch_episodes=32,
+                          R=R_base)
+
+        assert isinstance(batch, dict) and all(k in batch for k in ["obs","m","s","logp","adv","ret"]), \
+            f"Bad batch keys: {None if batch is None else list(batch.keys())}"
+        ppo_update_joint(policy, value, opt_pi, opt_v, cfg, batch, env_cfg=globalcfg, stage=1, width_prior_w=0)
+
+    # -------------------------
+    # Stage 2
     # -------------------------
     print("[Stage 2] start (regime-switching GBM)")
     freeze_centers_in_stage2(policy)
@@ -198,7 +224,7 @@ def main():
     opt_pi = optim.Adam(filter(lambda p: p.requires_grad, policy.parameters()), lr=cfg.lr_actor)
 
     stages = [
-        ([0.90],  6, 32, 0.020),
+        #([0.90],  6, 32, 0.020),
         ([0.95],  8, 32, 0.015),
         ([0.99,0.995], 10, 48, 0.012),
         ([0.995,0.999,1.0], 12, 48, 0.010),
@@ -228,8 +254,8 @@ def main():
     outdir = "checkpoints_regime_A2"
     os.makedirs(outdir, exist_ok=True)
 
-    torch.save(policy.state_dict(), os.path.join(outdir, "policy_stage2_A2_minvar.pt"))
-    torch.save(value.state_dict(),  os.path.join(outdir, "value_stage2_A2_minvar.pt"))
+    torch.save(policy.state_dict(), os.path.join(outdir, "policy_2stage_A2_minvar_obsupdate.pt"))
+    torch.save(value.state_dict(),  os.path.join(outdir, "value_2stage_A2_minvar_obsupdate.pt"))
     meta = dict(
         N_ASSETS=N,
         target_choices=target_choices,

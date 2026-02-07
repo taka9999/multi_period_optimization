@@ -517,6 +517,28 @@ def _burnin_slice_for_plot(
             W_plot = W_plot / base * w0
 
     return dates_plot, W_plot
+
+def _center_from_policy_deterministic(policy, o_np: np.ndarray, device: str, N: int) -> np.ndarray:
+    """
+    policy から deterministic center m を取得して、[0,1]^N かつ sum<=1 に正規化。
+    JointBandPolicy.sample_stage2() を優先（m決定論）。
+    """
+    o_t = torch.tensor(o_np, device=device).unsqueeze(0)  # [1, obs_dim]
+    with torch.no_grad():
+        if hasattr(policy, "sample_stage2"):
+            m_t, _, _, _, _ = policy.sample_stage2(o_t)    # agent.pyの仕様 :contentReference[oaicite:2]{index=2}
+        else:
+            # fallback: deterministic sample
+            m_t, _, _, _, _, _ = policy.sample(o_t, deterministic=True)
+
+    m = m_t.squeeze(0).detach().cpu().numpy().astype(float).reshape(-1)
+    # sanitize (simplex/boxの安定化)
+    m = np.clip(m, 0.0, 1.0)
+    ssum = float(m.sum())
+    if ssum > 1.0 + 1e-12:
+        m = m / (ssum + 1e-30)
+    return m
+
 # ============================================================
 # 4) Episode runners (Historical)
 # ============================================================
@@ -822,7 +844,7 @@ def run_episode_RL_band_A2_hist(
     width_all = []
 
     lookback = 252
-    m_star = None
+    #m_star = None
     mu_ann = Cov_ann = None
     rebalance_every = 21
 
@@ -835,25 +857,25 @@ def run_episode_RL_band_A2_hist(
                 lookback=lookback,
                 dt=float(cfg.dt_day),
             )
-            if mu_ann is not None:
-                m_new = mv_weights_target_return(
-                    Cov_ann, mu_ann, target_ann_eff,
-                    allow_cash=False,
-                    solver=mv_solver,
-                    infeasible_policy=infeasible_policy,
-                )
-                if m_new is not None:
-                    m_star = m_new
-        if (m_star is None) or (Cov_ann is None):
-            A = np.zeros(N)
-            B = np.ones(N)
-            width = float(np.mean(np.abs(B - A)))
-            action_norm = float(np.linalg.norm(b))  # = 0
-            obs, r, done, r_simple = env.step(A, B)
-            rs.append(float(r_simple))
-            if done:
-                break
-            continue
+            #if mu_ann is not None:
+                #m_new = mv_weights_target_return(
+                #    Cov_ann, mu_ann, target_ann_eff,
+                #    allow_cash=False,
+                #    solver=mv_solver,
+                #    infeasible_policy=infeasible_policy,
+                #)
+                #if m_new is not None:
+                #    m_star = m_new
+        #if (m_star is None) or (Cov_ann is None):
+        #    A = np.zeros(N)
+        #    B = np.ones(N)
+        #    width = float(np.mean(np.abs(B - A)))
+        #    action_norm = float(np.linalg.norm(b))  # = 0
+        #    obs, r, done, r_simple = env.step(A, B)
+        #    rs.append(float(r_simple))
+        #    if done:
+        #        break
+        #    continue
         o = np.array(obs, dtype=np.float32)
         if gamma_seq is not None:
             o = augment_obs_with_gamma(o, gamma_seq[_t])
@@ -867,15 +889,18 @@ def run_episode_RL_band_A2_hist(
 
         if force_s_one:
             s = np.ones_like(s, dtype=float)
-
+        
+        m = _center_from_policy_deterministic(policy, o, device=device, N=N)
 
         # If MV center is not available yet, fall back to no-trade wide band
         lam_scalar = float(env.lam.mean()) if isinstance(env.lam, np.ndarray) else float(env.lam)
-        if (m_star is None) or (Cov_ann is None):
-            A = np.zeros(N)
-            B = np.ones(N)
+        if Cov_ann is None:
+            A = np.zeros(N); B = np.ones(N)
+        #if (m_star is None) or (Cov_ann is None):
+        #    A = np.zeros(N)
+        #    B = np.ones(N)
         else:
-            m = np.asarray(m_star, float).reshape(-1)
+            #m = np.asarray(m_star, float).reshape(-1)
             minm = np.minimum(m, 1.0 - m)
 
             delta = compute_delta_box(
@@ -929,6 +954,167 @@ def run_episode_RL_band_A2_hist(
         width_all=np.asarray(width_all),
         mstar_shift=0.0,
     )
+    return dict(rs=np.asarray(rs, float), stats=stats)
+
+def run_episode_RL_band_A2_hist_MPC(
+    cfg,
+    R_corr,
+    returns_log,
+    policy,
+    lam_cost,
+    target_ann,
+    *,
+    start_idx: int,
+    T_total_days: int,
+    seed: int = 2025,
+    horizon_days: int = 252,
+    rebalance_every: int = 21,
+    device="cpu",
+    mv_solver: str = "OSQP",
+    infeasible_policy: str = "skip",
+    force_s_one: bool = False,
+    gamma_seq: np.ndarray | None = None,
+):
+    cfg.seed = int(seed)
+    N = cfg.N_ASSETS
+    t = 0
+    w_current = np.full(N, 1.0 / N) * 0.8
+    rs = []
+
+    # ---- stats (cumulative over MPC horizon) ----
+    inside_cnt = outside_cnt = 0
+    trigger_cnt = 0
+    turnover_sum = sold_sum = cost_drag_sum = 0.0
+    dist_sum = 0.0
+    action_sum = 0.0
+    width_all = []
+    #m_prev = None
+
+    while t < T_total_days:
+        # --- ① rolling windowで Cov 推定 ---
+        window = returns_log[start_idx + t - horizon_days : start_idx + t]
+        if window.shape[0] < horizon_days:
+            break
+
+        mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(
+            window, dt=float(cfg.dt_day)
+        )
+
+        #m_star = mv_weights_target_return(
+        #    Cov_ann, mu_ann, target_ann,
+        #    allow_cash=False,
+        #    solver=mv_solver,
+        #    infeasible_policy=infeasible_policy,
+        #)
+        #if m_star is None:
+        #    break
+        
+
+        #if m_prev is not None:
+        #    print("t=", t, "start=", start_idx+t, "dm1=", np.sum(np.abs(m_star-m_prev)))
+        #else:
+        #    print("t=", t, "start=", start_idx+t, "dm1=NA")
+        #m_prev = m_star.copy()
+
+        # --- ② env を 1年 horizon で reset ---
+        env = HistoricalBandEnvMulti(
+            cfg=cfg,
+            R=R_corr,
+            returns_log=returns_log,
+            start_idx=start_idx + t,
+            T_days=horizon_days,
+            returns_are_excess=False,
+        )
+        obs = env.reset(
+            beta=np.zeros(N),
+            lam=lam_cost,
+            target_ret=target_ann,
+            w0=w_current,
+        )
+
+        lam_scalar = float(env.lam.mean()) if isinstance(env.lam, np.ndarray) else float(env.lam)
+
+        # --- ③ 最初の 1か月だけ実行 ---
+        for _ in range(min(rebalance_every, horizon_days)):
+            o = np.array(obs, dtype=np.float32)
+
+            with torch.no_grad():
+                s = policy.sample_s_only(
+                    torch.tensor(o, device=device).unsqueeze(0)
+                )[0].squeeze(0).cpu().numpy()
+
+            if force_s_one:
+                s = np.ones_like(s, dtype=float)
+
+            m = _center_from_policy_deterministic(policy, o, device=device, N=N)
+
+            delta = compute_delta_box(
+                w_star=m,
+                Cov=Cov_ann,
+                gamma=float(getattr(cfg, "RISK_GAMMA", 0.0)),
+                lam=lam_scalar,
+                scale=1.0,
+                clip=(0.0, 1.0),
+            )
+
+            b = 0.95 * s * delta #* np.minimum(m, 1.0 - m)
+            A = clamp01_vec(m - b)
+            B = np.maximum(A + 1e-6, m + b)
+
+            # ---- stats BEFORE step ----
+            w_pre, Y_prev = _get_weights_and_wealth(env)
+            if w_pre is not None:
+                inside = bool(np.all(w_pre >= A - 1e-12) and np.all(w_pre <= B + 1e-12))
+                if inside:
+                    inside_cnt += 1
+                else:
+                    outside_cnt += 1
+                dist = 0.0 if inside else _distance_to_band_axis(w_pre, A, B)
+            else:
+                dist = np.nan
+
+            width = float(np.mean(np.abs(B - A)))
+            action_norm = float(np.linalg.norm(b))
+
+            # ---- step ----
+            obs, _, done, r_simple = env.step(A, B)
+            rs.append(float(r_simple))
+
+            # ---- stats AFTER step ----
+            if w_pre is not None and Y_prev is not None:
+                st = _trade_stats_step(env, w_pre, Y_prev, lam_scalar)
+                if st.get("did_trade", False):
+                    trigger_cnt += 1
+                if np.isfinite(st["turnover"]):   turnover_sum += st["turnover"]
+                if np.isfinite(st["sold_total"]): sold_sum     += st["sold_total"]
+                if np.isfinite(st["cost_drag"]):  cost_drag_sum+= st["cost_drag"]
+
+            if np.isfinite(dist):
+                dist_sum += dist
+            action_sum += action_norm
+            width_all.append(width)
+
+            if done:
+                break
+
+        # --- ④ 次月へ（state 引き継ぎ） ---
+        w_current, _ = _get_weights_and_wealth(env)
+        t += rebalance_every
+
+    stats = _finalize_stats(
+        steps=len(rs),
+        inside_cnt=inside_cnt,
+        outside_cnt=outside_cnt,
+        trigger_cnt=trigger_cnt,
+        turnover_sum=turnover_sum,
+        sold_sum=sold_sum,
+        cost_drag_sum=cost_drag_sum,
+        dist_sum=dist_sum,
+        action_sum=action_sum,
+        width_all=np.asarray(width_all),
+        mstar_shift=0.0,  # MPCでは定義しにくいので0でOK
+    )
+
     return dict(rs=np.asarray(rs, float), stats=stats)
 
 
@@ -1242,9 +1428,9 @@ def eval_frontier_historical(
                 trade_rows.append(dict(name="EW_monthly_cost", target=float(t_ann), seed=int(seed), start_idx=int(start_idx), **stats))
 
             # RL A2
-            out = run_episode_RL_band_A2_hist(
+            out = run_episode_RL_band_A2_hist_MPC(
                 cfg, R_corr, returns_log, policy_A2, lam_cost, t_ann,
-                start_idx=start_idx, T_days=T_days, seed=seed, device=cfg.device,
+                start_idx=start_idx, T_total_days=T_days, horizon_days = T_days,seed=seed, device=cfg.device,
                 mv_solver=mv_solver, infeasible_policy=infeasible_policy,
                 gamma_seq=gamma_seq
             )
@@ -1609,9 +1795,9 @@ def plot_wealth_overlay_grid_with_stats(
             cfg, np.eye(cfg.N_ASSETS), returns_log, lam_cost,
             start_idx=start_idx, T_days=T_days, rebalance_every=rebalance_every, seed=base_seed + i,
         )
-        out_a2 = run_episode_RL_band_A2_hist(
+        out_a2 = run_episode_RL_band_A2_hist_MPC(
             cfg, np.eye(cfg.N_ASSETS), returns_log, policy_A2, lam_cost, target_ann,
-            start_idx=start_idx, T_days=T_days, seed=base_seed + i,
+            start_idx=start_idx, T_total_days=T_days, horizon_days=T_days, seed=base_seed + i,
             device=cfg.device, mv_solver="OSQP", infeasible_policy="fallback",
         )
         out_b2 = run_episode_RL_band_B2_hist(
@@ -1971,21 +2157,70 @@ if __name__ == "__main__":
         K = gamma_all.shape[1]
         print(f"[HMM] computed gamma_all: T={gamma_all.shape[0]} K={K}")
 
-    # ----- load policies (if provided) -----
-    device = torch.device(args.device)
+    ## ----- load policies (if provided) -----
+    #device = torch.device(args.device)
+    #N = len(cols)
+    ## IMPORTANT: if you use gamma, policy/value must be instantiated with global_dim=4+K
+    #global_dim = 4 + (K if gamma_all is not None else 0)
+    #policyA2 = None
+    #policyB2 = None
+    #if args.policy_A2 is not None:
+    #    policyA2 = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True, global_dim=global_dim).to(device)
+    #    policyA2.load_state_dict(torch.load(args.policy_A2, map_location=device))
+    #    policyA2.eval()
+    #if args.policy_B2 is not None:
+    #    policyB2 = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True, global_dim=global_dim).to(device)
+    #    policyB2.load_state_dict(torch.load(args.policy_B2, map_location=device))
+    #    policyB2.eval()
+    
     N = len(cols)
-    # IMPORTANT: if you use gamma, policy/value must be instantiated with global_dim=4+K
-    global_dim = 4 + (K if gamma_all is not None else 0)
+    # Default global_dim (used only if no checkpoint is loaded)
+    global_dim_default = 4 + (K if gamma_all is not None else 0)
+
+    def _infer_dims_from_ckpt(sd: dict, fallback_global_dim: int):
+        """
+        Infer per_dim/global_dim from checkpoint weights.
+        - per_dim from body.token_enc.weight: [d_model, per_dim]
+        - global_dim from body.glob_proj.weight: [d_model, global_dim]
+        """
+        per_dim = None
+        glob_dim = None
+
+        w_tok = sd.get("body.token_enc.weight", None)
+        if w_tok is not None and hasattr(w_tok, "shape") and len(w_tok.shape) == 2:
+            per_dim = int(w_tok.shape[1])
+
+        w_glob = sd.get("body.glob_proj.weight", None)
+        if w_glob is not None and hasattr(w_glob, "shape") and len(w_glob.shape) == 2:
+            glob_dim = int(w_glob.shape[1])
+
+        if per_dim is None:
+            # fall back to old design (per_asset = [beta,w,sigma,Rw,lam] => 5)
+            per_dim = 5
+        if glob_dim is None:
+            glob_dim = int(fallback_global_dim)
+        return per_dim, glob_dim
+
+    def _load_policy_from_path(N:int, path: str, device: str = args.device) -> JointBandPolicy:
+        sd = torch.load(path, map_location=device)
+        per_dim_ckpt, global_dim_ckpt = _infer_dims_from_ckpt(sd, global_dim_default)
+        pol = JointBandPolicy(
+            N, d_model=128, nlayers=2, nhead=4,
+            use_cash_softmax=True,
+            global_dim=global_dim_ckpt,
+            per_dim=per_dim_ckpt,
+        ).to(device)
+        pol.load_state_dict(sd, strict=True)
+        pol.eval()
+        print(f"[Policy] loaded {path} with per_dim={per_dim_ckpt}, global_dim={global_dim_ckpt}")
+        return pol
+
     policyA2 = None
     policyB2 = None
     if args.policy_A2 is not None:
-        policyA2 = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True, global_dim=global_dim).to(device)
-        policyA2.load_state_dict(torch.load(args.policy_A2, map_location=device))
-        policyA2.eval()
+        policyA2 = _load_policy_from_path(N = N, path=args.policy_A2, device=args.device)
     if args.policy_B2 is not None:
-        policyB2 = JointBandPolicy(N, d_model=128, nlayers=2, nhead=4, use_cash_softmax=True, global_dim=global_dim).to(device)
-        policyB2.load_state_dict(torch.load(args.policy_B2, map_location=device))
-        policyB2.eval()
+        policyB2 = _load_policy_from_path(N = N, path=args.policy_B2, device=args.device)
     
     # ============================================================
     # 8) Frontier evaluation (HISTORICAL)

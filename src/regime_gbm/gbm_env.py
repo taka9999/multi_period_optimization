@@ -44,6 +44,17 @@ class globalsetting:
     REGIME_GAMMA_ON_OBS: bool = False
     OBS_BETA_ZERO: bool = True
 
+    # === rolling obs features (policy1) ===
+    ROLL_COV_SUMMARY_ON_OBS = True
+    ROLL_OBS_LOOKBACK = 63
+    ROLL_TOP_EIGS = 2
+
+    # per-asset token dim: [beta, w, sigma, Rw, lam, sigma_hat]
+    PER_ASSET_DIM = 6 if ROLL_COV_SUMMARY_ON_OBS else 5
+
+    # global base: [lam, target_ret_dt, port_var, rw_norm] = 4
+    # + (trace, cond, topk) = 2 + ROLL_TOP_EIGS
+    ROLL_GLOBAL_DIM = (2 + ROLL_TOP_EIGS) if ROLL_COV_SUMMARY_ON_OBS else 0
 
 def reflect_multi(S: np.ndarray,
                   C: float,
@@ -150,7 +161,6 @@ def buy_to_target_free(S, C, w_tgt, *, max_iter=10):
         C -= float(buy.sum())
 
     return S, C
-
 
 def project_axis_box_qp(
     w: np.ndarray,
@@ -606,6 +616,7 @@ class GBMBandEnvMulti:
         self.C = Y0 - self.S.sum()
         self.C = float(max(1e-8, self.C))
         self.w_prev = self.S / (self.S.sum() + self.C)
+        self._ret_hist = []   # list of np.ndarray shape (N,)
 
         return self._make_obs()
 
@@ -628,12 +639,54 @@ class GBMBandEnvMulti:
         sigma = self.sigmas                             # [N]
         Rw = self.R @ w                                 # [N]
 
-        per_asset = np.stack([beta, w, sigma, Rw, np.full_like(beta, lam_scalar)], axis=0).T  # [N,5]
-        per_asset_flat = per_asset.reshape(-1)                                             # [N*5]
+        sigma_hat = sigma
+        roll_global = None
+
+        if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
+            lb   = int(getattr(self.cfg, "ROLL_OBS_LOOKBACK", 63))
+            topk = int(getattr(self.cfg, "ROLL_TOP_EIGS", 2))
+
+            Cov_hat = None
+            if hasattr(self, "_ret_hist") and len(self._ret_hist) >= 2:
+                window = np.asarray(self._ret_hist[-lb:], float)  # [L, N]
+                if window.shape[0] >= 2:
+                    Cov_hat = np.cov(window, rowvar=False, ddof=1) / max(self.dt, 1e-12)  # annualized
+
+            if Cov_hat is None or (not np.all(np.isfinite(Cov_hat))):
+                Cov_hat = self.Cov
+
+            diag = np.clip(np.diag(Cov_hat), 0.0, None)
+            sigma_hat = np.sqrt(diag)
+
+            # global summaries
+            tr = float(np.trace(Cov_hat))
+            try:
+                eig = np.linalg.eigvalsh(Cov_hat)
+                eig = np.sort(np.real(eig))
+                eigmin = float(max(eig[0], 1e-12))
+                eigmax = float(max(eig[-1], 1e-12))
+                cond = float(eigmax / eigmin)
+                top = eig[::-1][:topk]
+            except Exception:
+                cond = float("nan")
+                top = np.full(topk, np.nan)
+
+            roll_global = np.concatenate([[tr, cond], np.asarray(top, float)], axis=0)
 
         port_var = float(w @ self.Cov @ w)
         rw_norm = float(np.linalg.norm(Rw))
+        #per_asset = np.stack([beta, w, sigma, Rw, np.full_like(beta, lam_scalar)], axis=0).T  # [N,5]
+        #per_asset_flat = per_asset.reshape(-1)                                             # [N*5]
+        #base = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
+        per_asset = np.stack(
+            [beta, w, sigma, Rw, np.full_like(beta, lam_scalar), sigma_hat],
+            axis=0
+            ).T  # [N,6]
+        per_asset_flat = per_asset.reshape(-1)  # [N*6]
         base = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
+        if roll_global is not None:
+            base = np.concatenate([base, roll_global], axis=0)
+
 
         # regime gamma (if present)
         if bool(getattr(self.cfg, "REGIME_GAMMA_ON_OBS", True)) and hasattr(self, "gamma") and self.gamma is not None:
@@ -740,6 +793,8 @@ class GBMBandEnvMulti:
 
         self.A_prev, self.B_prev = A.copy(), B.copy()
         obs = self._make_obs()
+        rlog = np.log(growth + 1e-30)
+        self._ret_hist.append(rlog.astype(float))
         return obs, float(r_step), done, float(r_simple)
     
     def step_rotated_box(
@@ -897,72 +952,6 @@ class GBMBandEnvMulti:
         r_step = u - trade_pen
 
         obs = self._make_obs()
-        return obs, float(r_step), done, float(r_simple)
-
-    def step_rotated_box_old(
-            self,
-            m: np.ndarray,
-            U: np.ndarray,
-            b_z: np.ndarray,
-            *,
-            allow_cash: bool = True,
-            solver: str = "OSQP",
-            use_trade_penalty: bool = False,
-            ):
-        """
-        Level B evaluation step:
-        - Project current w onto rotated box |U^T(w-m)|<=b_z with simplex constraints
-        - Execute sell-only trades towards the projected target
-        - Then run GBM dynamics and compute reward using existing logic
-        """
-        Y_prev = self.S.sum() + self.C
-        w = self.S / (Y_prev + 1e-30)
-
-        w_proj = project_rotated_box_qp(w, m, U, b_z, allow_cash=allow_cash, solver=solver)
-        self.S, self.C, sold_total = trade_to_target_sellonly(self.S, self.C, w_proj, self.lam)
-
-        # ---- GBM evolution (same as step) ----
-        z = self._draw_z()
-        mu = self.r + (self.sigmas**2) * self.beta
-        mu_eff = mu - self.r if self.discount_by_bank else mu
-        growth = np.exp((mu_eff - 0.5*self.sigmas**2)*self.dt + self.sigmas*np.sqrt(self.dt)*z)
-        self.S *= growth
-        self.C *= self.bank_growth
-        self.t += 1
-        done = (self.t >= self.T)
-        Y_next = self.S.sum() + self.C
-
-        # trade penalty (same rule)
-        trade_pen = 0.0
-        if use_trade_penalty:
-            lam_scalar = float(self.lam.mean()) if isinstance(self.lam, np.ndarray) else float(self.lam)
-            trade_pen = self.cfg.TRADE_PEN_COEF * (1.0 - lam_scalar) * float(sold_total / max(Y_prev, 1e-30))
-
-        # diagnostic return (keep simple)
-        r_simple = (Y_next / max(Y_prev, 1e-30)) - 1.0
-
-        # realized log return for training reward
-        gross = Y_next / max(Y_prev, 1e-30)
-        r_log = np.log(max(gross, 1e-30))
-
-        # MV/LQ shaping (same)
-        Y_mid = self.S.sum() + self.C
-        w_mid = self.S / (Y_mid + 1e-30)
-
-        mu = self.r + (self.sigmas**2) * self.beta
-        mu_eff = mu - self.r if self.discount_by_bank else mu
-
-        mu_w_dt  = float(mu_eff @ w_mid) * self.dt
-        var_w_dt = float(w_mid @ self.Cov @ w_mid) * self.dt
-
-        eta_target = float(getattr(self.cfg, "TARGET_ETA", 0.0))
-        shortfall = max(0.0, float(self.target_ret_dt) - mu_w_dt)
-
-        # additional risk penalty
-        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 0.0))
-
-        u = r_log - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
-        r_step = u - trade_pen
-
-        obs = self._make_obs()
+        rlog = np.log(growth + 1e-30)
+        self._ret_hist.append(rlog.astype(float))
         return obs, float(r_step), done, float(r_simple)

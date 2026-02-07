@@ -725,14 +725,17 @@ if __name__ == "__main__":
     cfg.minibatch_size = 2048
     cfg.global_dim = 4 + K
 
+    per_dim = getattr(gcfg, "PER_DIM", 5)
     policy = JointBandPolicy(
         gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
         use_cash_softmax=True,
         global_dim=cfg.global_dim,
+        per_dim=per_dim,
     ).to(gcfg.device)
     valuef = ValueNetCLS(
         gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
         global_dim=cfg.global_dim,
+        per_dim=per_dim,
     ).to(gcfg.device)
 
     # NOTE: if you load a checkpoint trained without regime gamma (global_dim=4)
