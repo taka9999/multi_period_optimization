@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 import time
 from typing import Any, Dict, List, Tuple, Optional
+import warnings
 
 import numpy as np
 import cvxpy as cp
@@ -364,107 +365,6 @@ def compute_levelB_basis_and_width(m_star, Cov, gamma, lam_scalar, eps=1e-12, sc
     delta_z = np.maximum(delta_z, 0.0)
     return U, delta_z
 
-def run_episode_RL_band_levelB_v2(env_cfg, R, policy, beta, lam_cost, target_ann, seed=2025, T=None, device="cpu",
-                               infeasible_policy="skip", mv_solver="OSQP", qp_solver="OSQP",
-                               mv_allow_cash=False, force_s_one: bool = False, return_step :bool = True):
-    """
-    Level B executor evaluation:
-      - compute MV center m_star (same as A2)
-      - build rotated basis U and z-width prior delta_z (once per episode)
-      - per step: get s (or force s≡1), set b_z = 0.95*s*delta_z, then env.step_rotated_box(...)
-    Returns: rsimple array or None if infeasible
-    """
-    cfg2 = env_cfg
-    cfg2.seed = int(seed)
-
-    env = GBMBandEnvMulti(cfg=cfg2, R=R)
-    N = cfg2.N_ASSETS
-    w0 = np.full(N, 1.0 / N) * 0.8
-    obs = env.reset(beta=beta, lam=lam_cost, target_ret=target_ann, w0=w0)
-
-    target_ann_eff = float(env.target_ret_ann)
-    mu_eff = (cfg2.sigmas**2) * beta
-    m_star = mv_weights_target_return(env.Cov, mu_eff, target_ann_eff, allow_cash=mv_allow_cash,
-                                      solver=mv_solver, infeasible_policy=infeasible_policy)
-    if m_star is None:
-        return None
-
-    T = env.T if T is None else int(T)
-    rsimple = []
-    rstep = []
-
-    lam_scalar = float(env.lam.mean()) if isinstance(env.lam, np.ndarray) else float(env.lam)
-    U, delta_z = compute_levelB_basis_and_width(
-        m_star=m_star,
-        Cov=env.Cov,
-        gamma=float(getattr(cfg2, "RISK_GAMMA", 1.0)),
-        lam_scalar=lam_scalar,
-        scale=1.0,
-    )
-
-    for _ in range(T):
-        o = np.array(obs, dtype=np.float32)
-
-        # get s from policy (same as A2), or force s≡1
-        if force_s_one:
-            s = np.ones(N, dtype=float)
-        else:
-            with torch.no_grad():
-                if hasattr(policy, "sample_s_only"):
-                    s_t, _, _ = policy.sample_s_only(torch.tensor(o, device=device).unsqueeze(0))
-                    s = s_t.squeeze(0).detach().cpu().numpy()
-                else:
-                    _, s_t, _, _, _ = policy.sample_stage2(torch.tensor(o, device=device).unsqueeze(0))
-                    s = s_t.squeeze(0).detach().cpu().numpy()
-
-        b_z = 0.95 * s * delta_z
-
-        obs, r_step, done, r_simple = env.step_rotated_box(
-            m=m_star, U=U, b_z=b_z,
-            allow_cash=mv_allow_cash,
-            solver=qp_solver,
-            use_trade_penalty=True
-        )
-        rsimple.append(float(r_simple))
-        rstep.append(float(r_step))
-        if done:
-            break
-    if return_step:
-        return np.array(rsimple), np.array(rstep)
-    else:
-        return np.array(rsimple)
-
-def eval_levelB_fixed_cases(
-    gcfg, R, policy, cases, *, device, mv_solver="OSQP", qp_solver="OSQP",
-    infeasible_policy="fallback", mv_allow_cash=False, force_s_one=False,
-):
-    rews = []
-    lrets = []
-    T_days = gcfg.T_days
-    for (seed, beta, lam, target_ann) in cases:
-        rs, rsteps = run_episode_RL_band_levelB_v2(
-            gcfg, R, policy, beta, lam, target_ann,
-            seed=seed, T=T_days, device=device,
-            infeasible_policy=infeasible_policy, mv_solver=mv_solver,
-            qp_solver=qp_solver, mv_allow_cash=mv_allow_cash,
-            force_s_one=force_s_one,
-            return_step=True,
-        )
-        if rs is None:
-            continue
-        # ここはあなたの定義に合わせて（例：logret の合計など）でOK
-        rews.append(float(np.sum(rsteps)))              # 例：簡易
-        lrets.append(float(np.sum(np.log1p(rs))))   # 例：簡易
-
-    out = {
-        "n_ok": len(rews),
-        "rew_ep_mean": float(np.mean(rews)) if rews else np.nan,
-        "rew_ep_std":  float(np.std(rews))  if rews else np.nan,
-        "lret_ep_mean": float(np.mean(lrets)) if lrets else np.nan,
-        "lret_ep_std":  float(np.std(lrets))  if lrets else np.nan,
-    }
-    return out
-
 def finetune_stage2_levelB(
     policy: JointBandPolicy,
     valuef: ValueNetCLS,
@@ -486,6 +386,8 @@ def finetune_stage2_levelB(
     env_ctor=None,
     ckpt_dir: str | None = None,
     save_every: int = 1,
+    center_mode: str = "policy",
+    center_policy: JointBandPolicy | None = None,
 ):
     device = gcfg.device
     policy.to(device); valuef.to(device)
@@ -571,21 +473,57 @@ def finetune_stage2_levelB(
     for k in range(1, fine_tune_epochs + 1):
 
         # ---- collect batch ----
-        batch = rollout_joint_levelB(
-            policy, valuef, cfg,
-            gcfg=gcfg,
-            lam_choices=lam_choices,
-            target_choices=target_choices,
-            batch_episodes=cfg.batch_episodes,
-            R=None if market_sampler is not None else R,
-            market_sampler=market_sampler,
-            base_seed=base_seed,
-            seed_offset=100000 * k,
-            mv_allow_cash=mv_allow_cash,
-            mv_solver=mv_solver,
-            qp_solver=qp_solver,
-            topk=topk,
-        )
+        #batch = rollout_joint_levelB(
+        #    policy, valuef, cfg,
+        #    gcfg=gcfg,
+        #    lam_choices=lam_choices,
+        #    target_choices=target_choices,
+        #    batch_episodes=cfg.batch_episodes,
+        #    R=None if market_sampler is not None else R,
+        #    market_sampler=market_sampler,
+        #    base_seed=base_seed,
+        #    seed_offset=100000 * k,
+        #    mv_allow_cash=mv_allow_cash,
+        #    mv_solver=mv_solver,
+        #    qp_solver=qp_solver,
+        #    topk=topk,
+        #)
+
+        # rollout側が center_mode を受け取るなら渡す（受け取れない場合は従来通り）
+        try:
+            batch = rollout_joint_levelB(
+                policy, valuef, cfg,
+                gcfg=gcfg,
+                lam_choices=lam_choices,
+                target_choices=target_choices,
+                batch_episodes=cfg.batch_episodes,
+                R=None if market_sampler is not None else R,
+                market_sampler=market_sampler,
+                base_seed=base_seed,
+                seed_offset=100000 * k,
+                mv_allow_cash=mv_allow_cash,
+                mv_solver=mv_solver,
+                qp_solver=qp_solver,
+                topk=topk,
+                center_mode=center_mode,
+                center_policy=center_policy,
+            )
+        except TypeError:
+            batch = rollout_joint_levelB(
+                policy, valuef, cfg,
+                gcfg=gcfg,
+                lam_choices=lam_choices,
+                target_choices=target_choices,
+                batch_episodes=cfg.batch_episodes,
+                R=None if market_sampler is not None else R,
+                market_sampler=market_sampler,
+                base_seed=base_seed,
+                seed_offset=100000 * k,
+                mv_allow_cash=mv_allow_cash,
+                mv_solver=mv_solver,
+                qp_solver=qp_solver,
+                topk=topk,
+            )
 
         # ---- s statistics on the rollout batch obs (cheap) ----
         # batch["obs"] is [T_total, obs_dim] on device already
@@ -622,6 +560,9 @@ def finetune_stage2_levelB(
                  mv_solver=mv_solver,
                  qp_solver=qp_solver,
                  topk=topk,
+                 env_ctor=env_ctor,
+                 center_mode=center_mode,
+                 center_policy=center_policy,
              )
         else:
              # NOTE: rollout_eval_levelB は env_ctor を受け取れない実装なので regime モードではスキップ
@@ -687,6 +628,8 @@ if __name__ == "__main__":
     ap.add_argument("--value_in",  type=str, default="value_stage2_A2.pt")
     ap.add_argument("--policy_out", type=str, default="policy_stage2_B2_2_finetuned.pt")
     ap.add_argument("--value_out",  type=str, default="value_stage2_B2_2_finetuned.pt")
+    ap.add_argument("--center_policy_in",type=str,default=None,help="(optional) fixed center policy checkpoint (e.g., trained A2). If set, Level-B finetune uses this center and only learns widths.")
+
     ap.add_argument("--corr_randomize", action="store_true", help="randomize correlation/sigmas per episode during finetune (also in regime mode)")
     ap.add_argument("--ckpt_dir", type=str, default="checkpoints_regime_B2/finetune_runs")
     ap.add_argument("--save_every", type=int, default=1)
@@ -723,20 +666,99 @@ if __name__ == "__main__":
     cfg.batch_episodes = 16          # B rollout重いのでまず小さめ推奨
     cfg.epochs = 4
     cfg.minibatch_size = 2048
-    cfg.global_dim = 4 + K
+    #cfg.global_dim = 4 + K
 
-    per_dim = getattr(gcfg, "PER_DIM", 5)
+    #per_dim = getattr(gcfg, "PER_DIM", 5)
+    #policy = JointBandPolicy(
+    #    gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
+    #    use_cash_softmax=True,
+    #    global_dim=cfg.global_dim,
+    #    per_dim=per_dim,
+    #).to(gcfg.device)
+    #valuef = ValueNetCLS(
+    #    gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
+    #    global_dim=cfg.global_dim,
+    #    per_dim=per_dim,
+    #).to(gcfg.device)
+
+
+    # ------------------------------------------------------------
+    # Infer obs dims from checkpoint (MOST ROBUST)
+    # ------------------------------------------------------------
+    sd_pi = torch.load(args.policy_in, map_location=gcfg.device)
+    # token_enc: [d_model, per_dim]
+    per_dim_ckpt = int(sd_pi["body.token_enc.weight"].shape[1])
+    # glob_proj: [d_model, global_dim]
+    global_dim_ckpt = int(sd_pi["body.glob_proj.weight"].shape[1])
+
+    # reflect into cfg/gcfg so rollout/env obs must match
+    cfg.global_dim = global_dim_ckpt
+    cfg.per_asset_dim = per_dim_ckpt
+    gcfg.PER_ASSET_DIM = per_dim_ckpt
+
+    # if global_dim includes roll summaries, set flags consistently (optional but helpful)
+    base = 4 + int(K)
+    roll_extra = max(0, global_dim_ckpt - base)
+    if roll_extra > 0:
+        gcfg.ROLL_COV_SUMMARY_ON_OBS = True
+        # roll_extra = 2 + topk
+        gcfg.ROLL_TOP_EIGS = max(0, roll_extra - 2)
+    else:
+        gcfg.ROLL_COV_SUMMARY_ON_OBS = False
+        gcfg.ROLL_TOP_EIGS = 0
+
     policy = JointBandPolicy(
         gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
         use_cash_softmax=True,
         global_dim=cfg.global_dim,
-        per_dim=per_dim,
+        per_dim=cfg.per_asset_dim,
     ).to(gcfg.device)
     valuef = ValueNetCLS(
         gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
         global_dim=cfg.global_dim,
-        per_dim=per_dim,
+        per_dim=cfg.per_asset_dim,
     ).to(gcfg.device)
+
+    # Load main (width) policy/value
+    policy.load_state_dict(sd_pi, strict=True)
+    sd_v = torch.load(args.value_in, map_location=gcfg.device)
+    valuef.load_state_dict(sd_v, strict=True)
+
+    # ------------------------------------------------------------
+    # Optional fixed center policy (A2): same dims as its ckpt
+    # ------------------------------------------------------------
+    center_policy = None
+    if args.center_policy_in is not None:
+        sd_c = torch.load(args.center_policy_in, map_location=gcfg.device)
+        per_c = int(sd_c["body.token_enc.weight"].shape[1])
+        glob_c = int(sd_c["body.glob_proj.weight"].shape[1])
+        center_policy = JointBandPolicy(
+            gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
+            use_cash_softmax=True,
+            global_dim=glob_c,
+            per_dim=per_c,
+        ).to(gcfg.device)
+        center_policy.load_state_dict(sd_c, strict=True)
+        center_policy.eval()
+        for p in center_policy.parameters():
+            p.requires_grad_(False)
+
+    center_policy = None
+    if args.center_policy_in is not None and str(args.center_policy_in).strip() != "":
+        center_policy = JointBandPolicy(
+            gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
+            use_cash_softmax=True,
+            global_dim=cfg.global_dim,
+            per_dim=getattr(cfg, "per_asset_dim", 5),
+        ).to(gcfg.device)
+
+        sd = torch.load(args.center_policy_in, map_location=gcfg.device)
+        center_policy.load_state_dict(sd, strict=False)
+        center_policy.eval()
+        for p in center_policy.parameters():
+            p.requires_grad_(False)
+        print(f"[load] center_policy: {args.center_policy_in}")
+
 
     # NOTE: if you load a checkpoint trained without regime gamma (global_dim=4)
     # into a model with regime gamma (global_dim=4+K), some weights will mismatch.
@@ -766,6 +788,8 @@ if __name__ == "__main__":
         market_sampler=(market_sampler if env_ctor is None else None),
         ckpt_dir=args.ckpt_dir,
         save_every=args.save_every,
+        center_mode="policy",
+        center_policy=center_policy,
     )
 
     # fine-tuned weights save

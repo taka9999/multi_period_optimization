@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Dict, Tuple, Callable
 import copy
+import warnings
 
 import numpy as np
 import torch
@@ -390,29 +391,6 @@ def compute_delta_rotated(
     jitter_cov: float = 0.0,        # e.g. 1e-10 if Cov is ill-conditioned
     debug: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Build Level-B (U, delta_z) using eigendecomposition of a* = Q(m)CovQ(m).
-    delta_z_k ∝ (kappa * eig_a_k / Gamma_kk)^{1/3},
-    where Gamma_kk ≈ (1+gamma) * (U^T Cov U)_kk.
-
-    Stability: apply a tiny *relative* eigenvalue floor based on trace(a)/N.
-    This preserves scaling and barely affects principal directions.
-    """
-    #m_star = np.asarray(m_star, float).reshape(-1)
-    #Cov = np.asarray(Cov, float)
-    #N = m_star.size
-
-    # symmetrize + optional jitter for numerical PSD
-    #Cov = 0.5 * (Cov + Cov.T)
-    #if jitter_cov > 0.0:
-    #    Cov = Cov + float(jitter_cov) * np.eye(N)
-
-    #kappa = max(0.0, 1.0 - float(lam))
-
-    #Q = np.diag(m_star) - np.outer(m_star, m_star)
-    #a = Q @ Cov @ Q
-    #a = 0.5 * (a + a.T)
-
     # Force stable float64 and sanitize weights (important near the simplex boundary).
     m_star = np.asarray(m_star, dtype=np.float64).reshape(-1)
     Cov = np.asarray(Cov, dtype=np.float64)
@@ -432,9 +410,6 @@ def compute_delta_rotated(
     a = 0.5 * (a + a.T)
 
     tr_a = float(np.trace(a))
-    # If a is (numerically) degenerate, the theoretical limit is delta_z -> 0,
-    # and eigenvectors are not identifiable. Return a canonical basis to avoid flips.
-    # Threshold is relative to Cov scale so it's not sensitive to units.
     tr_C = float(np.trace(Cov))
     if tr_a <= max(1e-18, eps) * max(1.0, tr_C):
         # Optional debug:
@@ -473,8 +448,6 @@ def compute_delta_rotated(
         print("[delta_rot dbg] m*: min/med/max/sum",
             m_star.min(), np.median(m_star), m_star.max(), m_star.sum())
         print("[delta_rot dbg] trace(a)", np.trace(a), "||a||_F", np.linalg.norm(a))
-
-
     return U, delta_z
 
 def apply_topk_s(s:np.ndarray, *, topk: int | None) -> np.ndarray:
@@ -997,6 +970,8 @@ def rollout_joint_levelB(
     qp_solver: str = "OSQP",
     topk: int | None = None,
     env_ctor=None,
+    center_policy: JointBandPolicy | None = None,
+    center_mode: str = "policy",
 ) -> Dict[str, torch.Tensor]:
     """
     Stage-2 PPO batch collection under Level-B executor:
@@ -1009,6 +984,20 @@ def rollout_joint_levelB(
         raise ValueError("rollout_joint_levelB: provide either R or market_sampler")
     be = cfg.batch_episodes if batch_episodes is None else int(batch_episodes)
     N = gcfg.N_ASSETS
+
+    cm = str(center_mode).lower()
+    if cm not in ("mv", "policy"):
+        raise ValueError(f"center_mode must be 'mv' or 'policy', got {center_mode}")
+
+    def _normalize_center(m: np.ndarray) -> np.ndarray:
+        m = np.asarray(m, float).reshape(-1)
+        m = np.maximum(0.0, m)
+        s = float(m.sum())
+        if not np.isfinite(s) or s <= 1e-12:
+            warnings.warn("[rollout_levelB] bad m_star from policy; fallback to uniform.")
+            return np.full(N, 1.0 / N, dtype=float)
+        # centerは通常 simplex 上に置きたい（allow_cash=Trueでも中心を1に揃えるのが無難）
+        return (m / s)
 
     obs_buf, m_buf, s_buf, logp_buf, adv_buf, ret_buf = [], [], [], [], [], []
     rew_ep = []
@@ -1054,10 +1043,29 @@ def rollout_joint_levelB(
         # MV center (same as A2 rollout)
         #m_star = mv_center_qp(env.Cov, gcfg_ep.sigmas, beta, target_ann_eff,
         #                      allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
-        sigmas_for_mv = np.asarray(getattr(env, "sigmas", gcfg_ep.sigmas), float).reshape(-1)
-        beta_for_mv = np.asarray(getattr(env, "beta", beta), float).reshape(-1)
-        m_star = mv_center_qp(env.Cov, sigmas_for_mv, beta_for_mv, target_ann_eff,
-                               allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
+        #sigmas_for_mv = np.asarray(getattr(env, "sigmas", gcfg_ep.sigmas), float).reshape(-1)
+        #beta_for_mv = np.asarray(getattr(env, "beta", beta), float).reshape(-1)
+        #m_star = mv_center_qp(env.Cov, sigmas_for_mv, beta_for_mv, target_ann_eff,
+        #                       allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
+
+        # ------------------------------------------------------------
+        # Center m_star (episode-fixed)
+        # ------------------------------------------------------------
+        cpol = center_policy if center_policy is not None else policy
+
+        if cm == "mv":
+            sigmas_for_mv = np.asarray(getattr(env, "sigmas", gcfg_ep.sigmas), float).reshape(-1)
+            beta_for_mv   = np.asarray(getattr(env, "beta", beta), float).reshape(-1)
+            m_star = mv_center_qp(
+                env.Cov, sigmas_for_mv, beta_for_mv, target_ann_eff,
+                allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver
+            )
+        else:
+            # center_policy(A2) から m を1回だけ決定論で取得して固定
+            o0 = torch.tensor(obs, dtype=torch.float32, device=gcfg_ep.device).unsqueeze(0)
+            m_t, _, _, _, _, _ = cpol.sample(o0, deterministic=True)   # m_t: [1,N]（すでに射影済）
+            m_star = m_t.squeeze(0).detach().cpu().numpy()
+
 
         # rotated-basis prior computed ONCE per episode (fast + stable)
         U, delta_z = compute_delta_rotated(
@@ -1170,6 +1178,8 @@ def rollout_eval_levelB(
     qp_solver: str = "OSQP",
     topk: int | None = None,
     env_ctor=None,
+    center_mode: str = "policy",
+    center_policy: Optional[JointBandPolicy] = None,
 ) -> Dict[str, float]:
     """
     Evaluate A2-trained policy under Level-B executor (rotated-box projection + sell/buy).
@@ -1230,6 +1240,35 @@ def rollout_eval_levelB(
 
         #m_star = mv_center_qp(env.Cov, gcfg_ep.sigmas, beta, target_ann_eff,
         #                      allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
+
+        cm = str(center_mode).lower().strip()
+        if cm == "mv":
+            sigmas_for_mv = np.asarray(getattr(env, "sigmas", gcfg_ep.sigmas), float).reshape(-1)
+            beta_for_mv   = np.asarray(getattr(env, "beta", beta), float).reshape(-1)
+            m_star = mv_center_qp(
+                env.Cov, sigmas_for_mv, beta_for_mv, target_ann_eff,
+                allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver
+            )
+        elif cm in ("policy", "a2", "center"):
+            pol_c = center_policy if center_policy is not None else policy
+            o0 = torch.tensor(obs, dtype=torch.float32, device=gcfg_ep.device).unsqueeze(0)
+            with torch.no_grad():
+                # deterministic=True で m だけ “固定センター” として使う
+                m_t, _, _, _, _, _ = pol_c.sample(o0, deterministic=True)
+            m_star = m_t.squeeze(0).detach().cpu().numpy()
+            # 安全に正規化（cash可否に合わせる）
+            m_star = np.clip(m_star, 0.0, 1.0)
+            s = float(np.sum(m_star))
+            if not np.isfinite(s) or s <= 1e-12:
+                m_star = np.ones_like(m_star) / len(m_star)
+            else:
+                if mv_allow_cash:
+                    if s > 1.0:
+                        m_star = m_star / s
+                else:
+                    m_star = m_star / s
+        else:
+            raise ValueError(f"unknown center_method={center_mode}")
 
         ep_rew = 0.0
         ep_lret = 0.0

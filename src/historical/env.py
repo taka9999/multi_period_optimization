@@ -145,7 +145,6 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
         rlog = self._rlog_t()
         self.S *= np.exp(rlog)
         self.C *= self.bank_growth
-        self._ret_hist.append(rlog.astype(float))
 
         self.t += 1
         done = bool(self.t >= self.T)
@@ -180,6 +179,9 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
 
         self.A_prev, self.B_prev = A.copy(), B.copy()
         obs = self._make_obs()
+        # IMPORTANT: append after obs to avoid look-ahead leakage (match GBM env)
+        if hasattr(self, "_ret_hist"):
+            self._ret_hist.append(np.asarray(rlog, float))
         return obs, float(r_step), done, float(r_simple)
 
     def step_rotated_box(
@@ -233,6 +235,8 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
             )
 
         r_simple = (Y_next / max(Y_prev, 1e-30)) - 1.0
+        gross = Y_next / max(Y_prev, 1e-30)
+        r_log = np.log(max(gross, 1e-30))
 
         # reward shaping (same as parent)
         Y_mid = float(self.S.sum() + self.C)
@@ -244,12 +248,15 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
         mu_w_dt = float(mu_eff @ w_mid) * self.dt
         var_w_dt = float(w_mid @ self.Cov @ w_mid) * self.dt
 
-        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 1.0))
+        gamma_risk = float(getattr(self.cfg, "RISK_GAMMA", 0.0))
         eta_target = float(getattr(self.cfg, "TARGET_ETA", 0.0))
         shortfall = max(0.0, float(self.target_ret_dt) - mu_w_dt)
 
-        u_mv = r_simple - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
+        u_mv = r_log - 0.5 * gamma_risk * var_w_dt - eta_target * shortfall
         r_step = u_mv - trade_pen
 
         obs = self._make_obs()
+        # IMPORTANT: update return history for rolling cov features (and avoid leakage)
+        if hasattr(self, "_ret_hist"):
+             self._ret_hist.append(np.asarray(rlog, float))
         return obs, float(r_step), done, float(r_simple)

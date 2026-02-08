@@ -1158,6 +1158,8 @@ def run_episode_RL_band_B2_hist(
     force_s_one: bool = False,
     topk: int | None = None,
     gamma_seq: np.ndarray | None = None,
+    center_mode: str = "policy",
+    center_policy: JointBandPolicy | None = None,
 ):
     cfg.seed = int(seed)
 
@@ -1174,33 +1176,6 @@ def run_episode_RL_band_B2_hist(
     obs = env.reset(beta=np.zeros(N), lam=lam_cost, target_ret=target_ann, w0=w0)
 
     target_ann_eff = float(env.target_ret_ann)
-
-    #window = np.asarray(returns_log[start_idx : start_idx + T_days], float)
-    #mu_ann, Cov_ann = estimate_mu_cov_ann_from_log_window(window, dt=float(cfg.dt_day))
-    #m_star = mv_weights_target_return(
-    #    Cov_ann, mu_ann, target_ann_eff, allow_cash=mv_allow_cash, solver=mv_solver, infeasible_policy=infeasible_policy
-    #)
-    #if m_star is None:
-    #    return None
-    
-    # sanitize m* (important near simplex boundary; keeps projection stable)
-    #m_star = np.asarray(m_star, dtype=float).reshape(-1)
-    #m_star = np.clip(m_star, 0.0, 1.0)
-    #ssum = float(m_star.sum())
-    #if mv_allow_cash:
-    #    if ssum > 1.0 + 1e-12:
-    #        m_star = m_star / (ssum + 1e-30)
-    #else:
-    #    m_star = m_star / (ssum + 1e-30)
-
-    #U, delta_z = compute_levelB_basis_and_width(
-    #    m_star=m_star,
-    #    Cov=Cov_ann,
-    #    gamma=float(getattr(cfg, "RISK_GAMMA", 0.0)),
-    #    lam_scalar=lam_scalar,
-    #    scale=1.0,
-    #)
-    
 
     rs = []
     inside_cnt = outside_cnt = 0
@@ -1228,22 +1203,47 @@ def run_episode_RL_band_B2_hist(
                 dt=float(cfg.dt_day),
             )
             if mu_ann is not None:
-                m_new = mv_weights_target_return(
-                    Cov_ann, mu_ann, target_ann_eff,
-                    allow_cash=False,
-                    solver=mv_solver,
-                    infeasible_policy=infeasible_policy,
-                )
-                if m_new is not None:
-                    m_star = m_new
-                    U, delta_z = compute_delta_rotated(
-                        m_star=m_star,
-                        Cov=Cov_ann,
-                        gamma=gamma_use,
-                        lam=lam_scalar,
-                        scale=1.0,
-                        debug=False,
-                        )
+                cm = str(center_mode).lower().strip()
+                if cm == "mv":
+                    sigmas_for_mv = np.asarray(getattr(env, "sigmas", cfg.sigmas), float).reshape(-1)
+                    beta_for_mv   = np.asarray(getattr(env, "beta", cfg.beta), float).reshape(-1)
+                    m_star = mv_weights_target_return(Cov_ann, mu_ann, target_ann_eff,allow_cash=False,solver=mv_solver,infeasible_policy=infeasible_policy,)
+                elif cm in ("policy", "a2", "center"):
+                    pol_c = center_policy if center_policy is not None else policy
+                    o0 = torch.tensor(obs, dtype=torch.float32, device=cfg.device).unsqueeze(0)
+                    with torch.no_grad():
+                        # deterministic=True で m だけ “固定センター” として使う
+                        m_t, _, _, _, _, _ = pol_c.sample(o0, deterministic=True)
+                    m_star = m_t.squeeze(0).detach().cpu().numpy()
+                    # 安全に正規化（cash可否に合わせる）
+                    m_star = np.clip(m_star, 0.0, 1.0)
+                    s = float(np.sum(m_star))
+                    if not np.isfinite(s) or s <= 1e-12:
+                        m_star = np.ones_like(m_star) / len(m_star)
+                    else:
+                        if mv_allow_cash:
+                            if s > 1.0:
+                                m_star = m_star / s
+                        else:
+                            m_star = m_star / s
+                else:
+                    raise ValueError(f"unknown center_method={center_mode}")
+                #m_new = mv_weights_target_return(
+                #    Cov_ann, mu_ann, target_ann_eff,
+                #    allow_cash=False,
+                #    solver=mv_solver,
+                #    infeasible_policy=infeasible_policy,
+                #)
+                #if m_new is not None:
+                    #m_star = m_new
+                U, delta_z = compute_delta_rotated(
+                    m_star=m_star,
+                    Cov=Cov_ann,
+                    gamma=gamma_use,
+                    lam=lam_scalar,
+                    scale=1.0,
+                    debug=False,
+                    )
         if (m_star is None) or (Cov_ann is None):
             A = np.zeros(N)
             B = np.ones(N)
@@ -1348,6 +1348,8 @@ def eval_frontier_historical(
     gamma_all: np.ndarray | None = None,
     outdir: str | None = None,
     burnin_steps: int = 0,
+    center_mode: str = "policy",
+    center_policy: JointBandPolicy | None = None,
 ):
     N = cfg.N_ASSETS
     # R_corr is unused for historical center (we use Cov_ann), but env signature requires it.
@@ -1451,7 +1453,7 @@ def eval_frontier_historical(
                 cfg, R_corr, returns_log, policy_B2, lam_cost, t_ann,
                 start_idx=start_idx, T_days=T_days, seed=seed, device=cfg.device,
                 mv_solver=mv_solver, qp_solver=qp_solver, infeasible_policy=infeasible_policy,
-                gamma_seq=gamma_seq
+                gamma_seq=gamma_seq,center_mode=center_mode, center_policy=center_policy,
             )
             if out is None:
                 skipped["RL_band_B2"][t_ann] += 1
@@ -1731,6 +1733,8 @@ def plot_wealth_overlay_grid_with_stats(
     gamma_full: Optional[np.ndarray] = None,
     gamma_dates: Optional[pd.DatetimeIndex] = None,
     burnin_steps: int = 0,
+    center_mode: str = "policy",
+    center_policy: JointBandPolicy | None = None,
 ):
     """
     Makes a grid of wealth overlays (n_windows windows), and:
@@ -1804,6 +1808,7 @@ def plot_wealth_overlay_grid_with_stats(
             cfg, np.eye(cfg.N_ASSETS), returns_log, policy_B2, lam_cost, target_ann,
             start_idx=start_idx, T_days=T_days, seed=base_seed + i,
             device=cfg.device, mv_solver="OSQP", qp_solver="OSQP", infeasible_policy="fallback",
+            center_mode=center_mode, center_policy=center_policy,
         )
         rs_mv_daily, st_mv_daily   = _normalize_episode_output(out_mv_daily)
         rs_mv_monthly, st_mv_monthly = _normalize_episode_output(out_mv_monthly)
@@ -2242,7 +2247,9 @@ if __name__ == "__main__":
         T_days=args.T_days,
         base_seed=2025,
         outdir=str(Path("outputs/historical")),
-        burnin_steps=int(args.burnin_days)
+        burnin_steps=int(args.burnin_days),
+        center_mode="policy",
+        center_policy=policyA2,
     )
 
     outdir = Path("outputs/historical")
@@ -2294,7 +2301,9 @@ if __name__ == "__main__":
             out_dir="outputs/historical",
             log_scale=args.wealth_log,
             crash_windows=parse_crash_windows(args.crash_windows),
-            burnin_steps=int(args.burnin_days)
+            burnin_steps=int(args.burnin_days),
+            center_mode="policy",
+            center_policy=policyA2,
         )
 
     # ============================================================
@@ -2311,5 +2320,3 @@ if __name__ == "__main__":
         print("[Gamma] saved gamma / entropy plots")
 
     print("=== DONE ===")
-
-

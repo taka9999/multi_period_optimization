@@ -82,10 +82,6 @@ def reflect_multi(S: np.ndarray,
     over = w - B
     sell_idx = np.where(over > 0.0)[0]
     for i in sell_idx:
-        # solve S_i_new such that w_i_new = B_i after paying cost
-        # Similar algebra to single-asset case; we sell d units:
-        # After sale: S_i' = S_i - d, C' = C + lam_i*d, Y' = Y - d + lam_i*d = Y - (1-lam_i)*d
-        # Impose w_i' = (S_i - d) / Y' = B_i  ⇒ solve for d
         Si, Bi, lami = S[i], B[i], lam_vec[i]
         num = max(0.0, Si - Bi*Y)
         denom = max(1e-12, 1.0 - Bi*(1.0 - lami))
@@ -658,6 +654,13 @@ class GBMBandEnvMulti:
             diag = np.clip(np.diag(Cov_hat), 0.0, None)
             sigma_hat = np.sqrt(diag)
 
+            mu_hat = np.zeros(self.N)
+            if hasattr(self, "_ret_hist") and len(self._ret_hist) >= 2:
+                window = np.asarray(self._ret_hist[-lb:], float)  # [L,N] ここは rlog を積んでる
+                if window.shape[0] >= 2:
+                    mu_hat = window.mean(axis=0) / max(self.dt, 1e-12)   # annualized drift
+
+
             # global summaries
             tr = float(np.trace(Cov_hat))
             try:
@@ -679,7 +682,7 @@ class GBMBandEnvMulti:
         #per_asset_flat = per_asset.reshape(-1)                                             # [N*5]
         #base = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
         per_asset = np.stack(
-            [beta, w, sigma, Rw, np.full_like(beta, lam_scalar), sigma_hat],
+            [beta, w, sigma, Rw, np.full_like(beta, lam_scalar), sigma_hat, mu_hat],
             axis=0
             ).T  # [N,6]
         per_asset_flat = per_asset.reshape(-1)  # [N*6]
@@ -869,14 +872,6 @@ class GBMBandEnvMulti:
             self.S, self.C = buy_to_target_free(
                 self.S, self.C, w_proj
             )
-
-            # optional debug: after trade
-            # Y_mid = float(self.S.sum() + self.C)
-            # w_after = self.S / (Y_mid + 1e-30)
-            # z_after = U.T @ (w_after - m)
-            # inside_after = np.all(np.abs(z_after) <= b_z + EPS_IN)
-
-        # --- after check (tradeした場合も、しない場合も) ---
         Y_mid2 = float(self.S.sum() + self.C)
         w_after = self.S / (Y_mid2 + 1e-30)
         z_after = U.T @ (w_after - m)
