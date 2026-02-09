@@ -648,7 +648,7 @@ def run_episode_MV_monthly_cost_hist(
             if mu_ann is not None:
                 w_new = mv_weights_target_return(
                     Cov_ann, mu_ann, target_ann_eff,
-                    allow_cash=False,
+                    allow_cash=True,
                     solver=mv_solver,
                     infeasible_policy=infeasible_policy
                 )
@@ -2134,9 +2134,50 @@ if __name__ == "__main__":
     ap.add_argument("--wealth_target", type=float, default=0.06)
     ap.add_argument("--wealth_windows", type=int, default=4)
     ap.add_argument("--wealth_log", action="store_true")
-
-
     args = ap.parse_args()
+
+    globalcfg = globalsetting(
+        seed    = 42,
+        device  = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        N_ASSETS = 5,
+        years = 1,
+        sigmas   = np.array([0.40, 0.30, 0.12, 0.22, 0.25], dtype=float),
+        pair_rhos = {
+            (0,1): 0.60,
+            (1,3): -0.20,
+            (2,4): 0.05,
+        },
+        
+        DISCOUNT_BY_BANK = True,
+        INIT_W0_UNIFORM = True,
+        BAND_SMOOTH_COEF = 0.0,
+        TRADE_PEN_COEF = 0.0,
+        ALPHA = 1/3,
+        STAGE1_WIDTH_COEF = 0,
+
+        # LQ / MV-style reward parameters
+        ALLOW_CASH_IN_MV = False,
+        MV_USE_TARGET = False,   # whether to use target return constraint in MV center
+        RISK_GAMMA = 0.0,
+        TARGET_ETA = 0.0,        # eta in hinge penalty eta*[target - mu^T w]_+
+        REGIME_GAMMA_ON_OBS = False,
+        OBS_BETA_ZERO = False,
+
+        ROLL_COV_SUMMARY_ON_OBS = True,
+        ROLL_OBS_LOOKBACK = 21,
+        ROLL_TOP_EIGS = 2,
+    )
+    # --- episode-level regime randomization ---
+    # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.
+    globalcfg.REGIME_EPISODE_RANDOMIZE = True
+    globalcfg.REGIME_BETA_STD = 0.25        # std for beta perturbation
+    globalcfg.REGIME_SIGMA_LOGSTD = 0.4    # log-std for sigma multiplicative noise
+    globalcfg.REGIME_CORR_NOISE = 0.08      # additive noise on correlation matrix entries
+    globalcfg.REGIME_BETA_CLIP = 0.999
+    globalcfg.REGIME_SIGMA_CLIP = (1e-4, 10.0)
+
+    REGIME_GAMMA_ON_OBS: bool = False
+    OBS_BETA_ZERO: bool = False
 
     df = pd.read_pickle(args.data)
     cols = [c.strip() for c in args.cols.split(",") if c.strip()]
@@ -2231,7 +2272,7 @@ if __name__ == "__main__":
     # 8) Frontier evaluation (HISTORICAL)
     # ============================================================
     targets = np.linspace(0.02, 0.10, 15)   # 2% ～ 10% 年率ターゲット
-    lam_cost = 0.99
+    lam_cost = 0.95
     rebalance_every = 21
 
     print("[Frontier] evaluating historical frontier ...")

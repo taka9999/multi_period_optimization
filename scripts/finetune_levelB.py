@@ -619,7 +619,45 @@ def finetune_stage2_levelB(
     return policy, valuef
 
 if __name__ == "__main__":
-    gcfg = globalsetting()
+    gcfg = globalsetting(
+        seed    = 42,
+        device  = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        N_ASSETS = 5,
+        years = 1,
+        sigmas   = np.array([0.40, 0.30, 0.12, 0.22, 0.25], dtype=float),
+        pair_rhos = {
+            (0,1): 0.60,
+            (1,3): -0.20,
+            (2,4): 0.05,
+        },
+
+        DISCOUNT_BY_BANK = True,
+        INIT_W0_UNIFORM = True,
+        BAND_SMOOTH_COEF = 0.0,
+        TRADE_PEN_COEF = 0.0,
+        ALPHA = 1/3,
+        STAGE1_WIDTH_COEF = 0,
+
+        # LQ / MV-style reward parameters
+        ALLOW_CASH_IN_MV = False,
+        MV_USE_TARGET = False,   # whether to use target return constraint in MV center
+        RISK_GAMMA = 0.0,
+        TARGET_ETA = 0.0,        # eta in hinge penalty eta*[target - mu^T w]_+
+        REGIME_GAMMA_ON_OBS = False,
+        OBS_BETA_ZERO = False,
+
+        ROLL_COV_SUMMARY_ON_OBS = True,
+        ROLL_OBS_LOOKBACK = 21,
+        ROLL_TOP_EIGS = 2,
+    )
+    # --- episode-level regime randomization ---
+    # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.
+    gcfg.REGIME_EPISODE_RANDOMIZE = True
+    gcfg.REGIME_BETA_STD = 0.25        # std for beta perturbation
+    gcfg.REGIME_SIGMA_LOGSTD = 0.4    # log-std for sigma multiplicative noise
+    gcfg.REGIME_CORR_NOISE = 0.08      # additive noise on correlation matrix entries
+    gcfg.REGIME_BETA_CLIP = 0.999
+    gcfg.REGIME_SIGMA_CLIP = (1e-4, 10.0)
     gcfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ap = argparse.ArgumentParser()
@@ -660,27 +698,12 @@ if __name__ == "__main__":
     else:
         gcfg.REGIME_GAMMA_ON_OBS = True
         K = int(len(regimes))
-    gcfg.OBS_BETA_ZERO = True
+    gcfg.OBS_BETA_ZERO = False
 
     cfg = PPOConfig()
-    cfg.batch_episodes = 16          # B rollout重いのでまず小さめ推奨
+    cfg.batch_episodes = 16
     cfg.epochs = 4
     cfg.minibatch_size = 2048
-    #cfg.global_dim = 4 + K
-
-    #per_dim = getattr(gcfg, "PER_DIM", 5)
-    #policy = JointBandPolicy(
-    #    gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
-    #    use_cash_softmax=True,
-    #    global_dim=cfg.global_dim,
-    #    per_dim=per_dim,
-    #).to(gcfg.device)
-    #valuef = ValueNetCLS(
-    #    gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
-    #    global_dim=cfg.global_dim,
-    #    per_dim=per_dim,
-    #).to(gcfg.device)
-
 
     # ------------------------------------------------------------
     # Infer obs dims from checkpoint (MOST ROBUST)
@@ -779,7 +802,7 @@ if __name__ == "__main__":
         target_choices=target_choices,
         fine_tune_epochs=6,      # ★ここを5〜10で
         width_prior_w=0.02,
-        mv_allow_cash=False,
+        mv_allow_cash=True,
         mv_solver="OSQP",
         qp_solver="OSQP",
         topk = 2,

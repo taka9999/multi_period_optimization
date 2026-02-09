@@ -30,7 +30,7 @@ class globalsetting:
     BAND_SMOOTH_COEF: float = 0.0
     TRADE_PEN_COEF: float = 0.0
     ALPHA: float = 1/3
-    STAGE1_WIDTH_COEF: float = 0.05
+    STAGE1_WIDTH_COEF: float = 0
 
     # LQ / MV-style reward parameters
     ALLOW_CASH_IN_MV: bool = False
@@ -42,19 +42,36 @@ class globalsetting:
     # base global feats are [lam, target_ret_dt, port_var, ||R w||] = 4 dims
     # if env provides self.gamma (len K), obs global dims become 4+K
     REGIME_GAMMA_ON_OBS: bool = False
-    OBS_BETA_ZERO: bool = True
+    OBS_BETA_ZERO: bool = False
 
     # === rolling obs features (policy1) ===
-    ROLL_COV_SUMMARY_ON_OBS = True
-    ROLL_OBS_LOOKBACK = 63
-    ROLL_TOP_EIGS = 2
+    ROLL_COV_SUMMARY_ON_OBS:bool = True
+    ROLL_OBS_LOOKBACK: int = 63
+    ROLL_TOP_EIGS: int = 2
 
-    # per-asset token dim: [beta, w, sigma, Rw, lam, sigma_hat]
-    PER_ASSET_DIM = 6 if ROLL_COV_SUMMARY_ON_OBS else 5
-
-    # global base: [lam, target_ret_dt, port_var, rw_norm] = 4
-    # + (trace, cond, topk) = 2 + ROLL_TOP_EIGS
-    ROLL_GLOBAL_DIM = (2 + ROLL_TOP_EIGS) if ROLL_COV_SUMMARY_ON_OBS else 0
+    # === downside deviation (portfolio realized) ===
+    # Add one global feature ddp (annualized-like downside deviation of realized portfolio log-return)
+    ROLL_DOWNSIDE_DEV_ON_OBS: bool = True
+    # threshold in dt units: 0.0 means downside relative to 0 return (log-return approx).
+    # If you want "below target", you can set this True and use target_ret_dt as threshold.
+    ROLL_DOWNSIDE_USE_TARGET: bool = False
+ 
+    # ---- derived dims (filled in __post_init__) ----
+    PER_ASSET_DIM: int = 0
+    ROLL_GLOBAL_DIM: int = 0
+ 
+    def __post_init__(self):
+        # per-asset token dims:
+        #   base: [beta, w, sigma, Rw, lam] -> 5
+        #   if ROLL_COV_SUMMARY_ON_OBS: add [sigma_hat, mu_hat] -> +2
+        self.PER_ASSET_DIM = 7 if self.ROLL_COV_SUMMARY_ON_OBS else 5
+ 
+        # global dims appended when ROLL_COV_SUMMARY_ON_OBS:
+        #   roll_global: [trace, cond] + topk eigenvalues -> 2 + ROLL_TOP_EIGS
+        # plus optional downside deviation ddp -> +1
+        add_dd = 1 if (self.ROLL_COV_SUMMARY_ON_OBS and self.ROLL_DOWNSIDE_DEV_ON_OBS) else 0
+        self.ROLL_GLOBAL_DIM = (2 + int(self.ROLL_TOP_EIGS) + add_dd) if self.ROLL_COV_SUMMARY_ON_OBS else 0
+  
 
 def reflect_multi(S: np.ndarray,
                   C: float,
@@ -613,6 +630,8 @@ class GBMBandEnvMulti:
         self.C = float(max(1e-8, self.C))
         self.w_prev = self.S / (self.S.sum() + self.C)
         self._ret_hist = []   # list of np.ndarray shape (N,)
+        # portfolio realized log-return history (for downside deviation)
+        self._pret_hist = []  # list of float (portfolio realized log return)
 
         return self._make_obs()
 
@@ -634,8 +653,9 @@ class GBMBandEnvMulti:
             beta = self.beta
         sigma = self.sigmas                             # [N]
         Rw = self.R @ w                                 # [N]
-
-        sigma_hat = sigma
+        # defaults when rolling features are off
+        sigma_hat = sigma.copy()
+        mu_hat = np.zeros(self.N, dtype=float)
         roll_global = None
 
         if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
@@ -654,7 +674,6 @@ class GBMBandEnvMulti:
             diag = np.clip(np.diag(Cov_hat), 0.0, None)
             sigma_hat = np.sqrt(diag)
 
-            mu_hat = np.zeros(self.N)
             if hasattr(self, "_ret_hist") and len(self._ret_hist) >= 2:
                 window = np.asarray(self._ret_hist[-lb:], float)  # [L,N] ここは rlog を積んでる
                 if window.shape[0] >= 2:
@@ -681,14 +700,36 @@ class GBMBandEnvMulti:
         #per_asset = np.stack([beta, w, sigma, Rw, np.full_like(beta, lam_scalar)], axis=0).T  # [N,5]
         #per_asset_flat = per_asset.reshape(-1)                                             # [N*5]
         #base = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
-        per_asset = np.stack(
-            [beta, w, sigma, Rw, np.full_like(beta, lam_scalar), sigma_hat, mu_hat],
-            axis=0
-            ).T  # [N,6]
-        per_asset_flat = per_asset.reshape(-1)  # [N*6]
+        if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
+            per_asset = np.stack(
+                [beta, w, sigma, Rw, np.full_like(beta, lam_scalar), sigma_hat, mu_hat],
+                axis=0
+            ).T  # [N,7]
+        else:
+            # [beta, w, sigma, Rw, lam] -> 5 dims
+            per_asset = np.stack(
+                [beta, w, sigma, Rw, np.full_like(beta, lam_scalar)],
+                axis=0
+            ).T  # [N,5]
+        per_asset_flat = per_asset.reshape(-1)
         base = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
         if roll_global is not None:
             base = np.concatenate([base, roll_global], axis=0)
+        # downside deviation of realized portfolio log return (global feature)
+        # ddp is annualized-like: sqrt(E[min(0, rp - tau)^2]) / sqrt(dt)
+        if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)) and bool(getattr(self.cfg, "ROLL_DOWNSIDE_DEV_ON_OBS", False)):
+            ddp = 0.0
+            lb = int(getattr(self.cfg, "ROLL_OBS_LOOKBACK", 63))
+            if hasattr(self, "_pret_hist") and len(self._pret_hist) >= 2:
+                win = np.asarray(self._pret_hist[-lb:], float)
+                if win.shape[0] >= 2:
+                    if bool(getattr(self.cfg, "ROLL_DOWNSIDE_USE_TARGET", False)):
+                        tau = float(self.target_ret_dt)  # dt units
+                    else:
+                        tau = 0.0
+                    x = np.minimum(0.0, win - tau)
+                    ddp = float(np.sqrt(np.mean(x*x)) / np.sqrt(max(self.dt, 1e-12)))
+            base = np.concatenate([base, np.array([ddp], float)], axis=0)
 
 
         # regime gamma (if present)
@@ -798,6 +839,18 @@ class GBMBandEnvMulti:
         obs = self._make_obs()
         rlog = np.log(growth + 1e-30)
         self._ret_hist.append(rlog.astype(float))
+        # portfolio realized log return (use post-trade weights, pre-return)
+        # rp_log ≈ w_trade · rlog (log-return approx)
+        try:
+            w_trade = getattr(self, "w_post_trade", None)
+            if w_trade is None:
+                Y_mid = self.S.sum() + self.C
+                w_trade = self.S / (Y_mid + 1e-30)
+            rp_log = float(np.dot(np.asarray(w_trade, float).reshape(-1), rlog.reshape(-1)))
+            self._pret_hist.append(rp_log)
+        except Exception:
+            # be tolerant; don't break training due to diagnostics
+            pass
         return obs, float(r_step), done, float(r_simple)
     
     def step_rotated_box(
@@ -949,4 +1002,14 @@ class GBMBandEnvMulti:
         obs = self._make_obs()
         rlog = np.log(growth + 1e-30)
         self._ret_hist.append(rlog.astype(float))
+        # portfolio realized log return (use post-trade weights, pre-return)
+        try:
+            w_trade = getattr(self, "w_post_trade", None)
+            if w_trade is None:
+                Y_mid = self.S.sum() + self.C
+                w_trade = self.S / (Y_mid + 1e-30)
+            rp_log = float(np.dot(np.asarray(w_trade, float).reshape(-1), rlog.reshape(-1)))
+            self._pret_hist.append(rp_log)
+        except Exception:
+            pass
         return obs, float(r_step), done, float(r_simple)

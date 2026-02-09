@@ -479,11 +479,12 @@ def rollout_joint(
     market_sampler: Optional[Callable[[np.random.Generator, int], Tuple[np.ndarray, np.ndarray]]] = None,
     base_seed: int = 1234,
     seed_offset: int = 0,
-    mv_allow_cash: bool = False,
+    mv_allow_cash: bool = True,
     mv_round_nd: int = 4,
     mv_solver: str = "OSQP",
     corr_mode: str = "full",
     env_ctor=None,
+    center_mode: str = "policy",
 ) -> Dict[str, torch.Tensor]:
     """
     MV center is computed outside the policy; policy outputs width only (s).
@@ -557,13 +558,14 @@ def rollout_joint(
         target_ann_eff = (float(env.target_ret_ann) if target_ann is not None else None)
         sigmas_for_mv = np.asarray(getattr(env, "sigmas", gcfg_ep.sigmas), float).reshape(-1)
         beta_for_mv = np.asarray(getattr(env, "beta", beta), float).reshape(-1)
-        m_star = mv_center_qp(env.Cov, sigmas_for_mv, beta_for_mv, target_ann_eff,
-                              allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
+        #m_star = mv_center_qp(env.Cov, sigmas_for_mv, beta_for_mv, target_ann_eff,
+        #                      allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
+
         if k == 0:
-            ms = m_star
-            print(f"[mv dbg] sum={ms.sum():.6f} "
-                f"nnz(>1e-8)={int((ms>1e-8).sum())}/{ms.size} "
-                f"min/med/max={ms.min():.3e}/{np.median(ms):.3e}/{ms.max():.3e}")
+            #ms = m_star
+            #print(f"[mv dbg] sum={ms.sum():.6f} "
+            #    f"nnz(>1e-8)={int((ms>1e-8).sum())}/{ms.size} "
+            #    f"min/med/max={ms.min():.3e}/{np.median(ms):.3e}/{ms.max():.3e}")
             print(
                 "[Cov dbg]",
                 "sigma=", np.round(env.sigmas, 3),
@@ -602,22 +604,32 @@ def rollout_joint(
             v_t = valuef(o)
 
             if stage == 1:
-                # stage1: fixed tiny width; no PPO on s (logp=0)
-                s_np = np.full(N, 0.5, dtype=float)
+                # ★毎 step m をサンプル（これが目的）
+                m_t, logp_m, m_pre = policy.sample_m_only(o)   # m_t:[1,N], logp_m:[1], m_pre:[1,N]
+                m_star = m_t.squeeze(0).detach().cpu().numpy()
+
+                # width は固定（stage1）
+                s_np  = np.full(N, 0.5, dtype=float)
                 s_pre = torch.tensor(s_np, dtype=torch.float32, device=gcfg_ep.device).unsqueeze(0)
-                logp_use = torch.zeros(1, device=gcfg_ep.device)
+
+                # ★old logp を保存（ゼロにしない）
+                logp_use = logp_m
+
             else:
+                # stage2: widthのみ学習（従来通り）
                 s_t, logp_use, s_pre = policy.sample_s_only(o)
                 s_np = s_t.squeeze(0).detach().cpu().numpy()
-
-                # --- s stats ---
-                s_arr = np.asarray(s_np, float).reshape(-1)
-                s_zero_list.append(float(np.mean(s_arr <= 1e-6)))
-                s_min_list.append(float(s_arr.min()))
-                s_mean_list.append(float(s_arr.mean()))
-                s_max_list.append(float(s_arr.max()))
-
-
+                # center は固定（policy deterministic でも、MVでも、center_modeに従う）
+                if center_mode == "policy":
+                    m_t, _, _, _, _, _ = policy.sample(o, deterministic=True)
+                    m = m_t.squeeze(0).detach().cpu().numpy()
+                    m_star = m
+                elif center_mode == "mv":
+                    m_star = mv_center_qp(
+                        env.Cov, sigmas_for_mv, beta_for_mv, target_ann_eff,
+                        allow_cash=mv_allow_cash, round_nd=mv_round_nd, solver=mv_solver)
+                else:
+                    raise ValueError("rollout_joint: invalid center_mode =", center_mode)
             m = m_star
             minm = np.minimum(m, 1.0 - m)
             # --- minm stats ---
@@ -637,7 +649,7 @@ def rollout_joint(
                       )
     
             if stage == 1:
-                b = gcfg_ep.STAGE1_WIDTH_COEF * 0.95 * minm
+                b = gcfg_ep.STAGE1_WIDTH_COEF
             else:
                 #lam_scalar = float(obs[N*5 + 0])
                 #g = (max(0.0, 1.0 - lam_scalar) + 1e-8) ** gcfg.ALPHA
@@ -663,7 +675,7 @@ def rollout_joint(
                 delta_med_list.append(float(np.median(delta_arr)))
                 delta_max_list.append(float(delta_arr.max()))
 
-                b = 0.95 * s_np * delta * minm
+                b = 0.95 * s_np * delta# * minm
                 b_arr = np.asarray(b, float).reshape(-1)
                 b_zero_list.append(float(np.mean(b_arr <= 1e-12)))
 
@@ -710,13 +722,10 @@ def rollout_joint(
             sqrtDii_med_list.append(float(np.median(sqrtDii)))
             sqrtDii_max_list.append(float(np.max(sqrtDii)))
 
-
             obs, r, done, _ = env.step(A, B, use_trade_penalty=(stage == 2))
-
             # ===== step-after gap (post-trade) =====
             Y_post = env.S.sum() + env.C
             w_post = env.S / (Y_post + 1e-30)
-
             # ===== top-k diagnostics (pre-trade) =====
             idx_topk = np.argsort(m_star)[::-1][:TOPK]
 
@@ -793,7 +802,10 @@ def rollout_joint(
 
 
             ep_obs.append(o.squeeze(0).detach().cpu())
-            ep_m.append(torch.tensor(m, dtype=torch.float32))
+            if stage == 1:
+                ep_m.append(m_pre.squeeze(0).detach().cpu())  # ★PPO側はこれをlogprobに使う
+            else:
+                ep_m.append(torch.tensor(m, dtype=torch.float32))
             ep_s.append(s_pre.squeeze(0).detach().cpu())
             ep_lp.append(logp_use.squeeze(0).detach().cpu())
             ep_val.append(v_t.squeeze(0).detach().cpu())

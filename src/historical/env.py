@@ -115,7 +115,7 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
         self.T = T
 
         # Z ignored (kept for signature compatibility)
-        return super().reset(
+        obs = super().reset(
             beta=np.asarray(beta, float),
             lam=lam,
             target_ret=target_ret,
@@ -124,6 +124,8 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
             w0=w0,
             Z=None,
         )
+        self._pret_hist = []
+        return obs
 
     def step(self, A: np.ndarray, B: np.ndarray, *, use_trade_penalty: bool = True):
         A = clamp01_vec(A)
@@ -140,6 +142,12 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
         # reflect / execute trades (same)
         Y_prev = float(self.S.sum() + self.C)
         self.S, self.C, sold_total = reflect_multi(self.S, self.C, A, B, self.lam)
+
+        # post-trade weights (pre-return) for portfolio realized log return approx
+        Y_mid = float(self.S.sum() + self.C)
+        w_trade = self.S / (Y_mid + 1e-30)
+        # store for consistency with gbm_env patch (optional)
+        self.w_post_trade = w_trade.copy()
 
         # ---- historical evolution (replaces GBM) ----
         rlog = self._rlog_t()
@@ -182,6 +190,15 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
         # IMPORTANT: append after obs to avoid look-ahead leakage (match GBM env)
         if hasattr(self, "_ret_hist"):
             self._ret_hist.append(np.asarray(rlog, float))
+        # portfolio realized log return history for downside deviation feature
+        # rp_log ≈ w_trade · rlog
+        try:
+            rp_log = float(np.dot(np.asarray(w_trade, float).reshape(-1), np.asarray(rlog, float).reshape(-1)))
+            if not hasattr(self, "_pret_hist"):
+                self._pret_hist = []
+            self._pret_hist.append(rp_log)
+        except Exception:
+            pass
         return obs, float(r_step), done, float(r_simple)
 
     def step_rotated_box(
@@ -215,7 +232,10 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
                 solver=solver
             )
             self.S, self.C, sold_total = trade_to_target_sellonly(self.S, self.C, w_proj, self.lam)
-
+        # post-trade weights (pre-return) for portfolio realized log return approx
+        Y_mid = float(self.S.sum() + self.C)
+        w_trade = self.S / (Y_mid + 1e-30)
+        self.w_post_trade = w_trade.copy()
         # ---- historical evolution (replaces GBM) ----
         rlog = self._rlog_t()
         self.S *= np.exp(rlog)
@@ -259,4 +279,12 @@ class HistoricalBandEnvMulti(GBMBandEnvMulti):
         # IMPORTANT: update return history for rolling cov features (and avoid leakage)
         if hasattr(self, "_ret_hist"):
              self._ret_hist.append(np.asarray(rlog, float))
+        # portfolio realized log return history for downside deviation feature
+        try:
+            rp_log = float(np.dot(np.asarray(w_trade, float).reshape(-1), np.asarray(rlog, float).reshape(-1)))
+            if not hasattr(self, "_pret_hist"):
+                self._pret_hist = []
+            self._pret_hist.append(rp_log)
+        except Exception:
+            pass
         return obs, float(r_step), done, float(r_simple)

@@ -7,17 +7,13 @@ import numpy as np
 import torch
 import torch.optim as optim
 
-
 from src.ppo.update import ppo_update_joint
 from src.ppo.agent import JointBandPolicy, ValueNetCLS, PPOConfig
-
 from src.utils.training_utils import freeze_width_head_in_stage1,freeze_centers_in_stage2
 from src.utils.rlopt_helpers import build_corr_from_pairs, build_cov
-
 from src.regime_gbm.gbm_env import globalsetting
 from src.ppo.rollout import rollout_joint
 from src.regime_gbm.regime_gbm_env import RegimeGBMBandEnvMulti
-
 
 def set_seed(seed: int, device):
     random.seed(seed)
@@ -72,18 +68,27 @@ def main():
             (1,3): -0.20,
             (2,4): 0.05,
         },
+        
         DISCOUNT_BY_BANK = True,
-        INIT_W0_UNIFORM  = True,
+        INIT_W0_UNIFORM = True,
         BAND_SMOOTH_COEF = 0.0,
-        TRADE_PEN_COEF   = 0.0,
+        TRADE_PEN_COEF = 0.0,
         ALPHA = 1/3,
-        STAGE1_WIDTH_COEF = 0.05,
+        STAGE1_WIDTH_COEF = 0,
 
+        # LQ / MV-style reward parameters
+        ALLOW_CASH_IN_MV = False,
+        MV_USE_TARGET = False,   # whether to use target return constraint in MV center
+        RISK_GAMMA = 0.0,
+        TARGET_ETA = 0.0,        # eta in hinge penalty eta*[target - mu^T w]_+
         REGIME_GAMMA_ON_OBS = False,
-        OBS_BETA_ZERO = True,
+        OBS_BETA_ZERO = False,
 
-
-    )
+        ROLL_COV_SUMMARY_ON_OBS = True,
+        ROLL_OBS_LOOKBACK = 21,
+        ROLL_TOP_EIGS = 2,
+        )
+    
     # --- episode-level regime randomization ---
     # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.
     globalcfg.REGIME_EPISODE_RANDOMIZE = True
@@ -167,12 +172,6 @@ def main():
 
     K = int(len(regimes)) if getattr(globalcfg, "REGIME_GAMMA_ON_OBS", False) else 0
     cfg.global_dim = 4 + roll_global_dim + K
-
-
-
-    # env factory to inject into rollout
-    #def env_ctor():
-    #    return RegimeGBMBandEnvMulti(cfg=globalcfg, regimes=regimes, P=P, init_regime=None, R=R_base)
     
     def env_ctor(gcfg_ep=None, R_ep=None, seed=None):
         g_use = globalcfg if gcfg_ep is None else gcfg_ep
@@ -209,7 +208,8 @@ def main():
                           target_choices=target_choices,
                           stage=1,
                           batch_episodes=32,
-                          R=R_base)
+                          R=R_base,
+                          center_mode="policy",)
 
         assert isinstance(batch, dict) and all(k in batch for k in ["obs","m","s","logp","adv","ret"]), \
             f"Bad batch keys: {None if batch is None else list(batch.keys())}"
@@ -267,7 +267,6 @@ def main():
         json.dump(meta, f, indent=2)
 
     print(f"[Checkpoint] saved to {outdir}/")
-
 
 if __name__ == "__main__":
     main()

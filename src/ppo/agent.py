@@ -188,6 +188,32 @@ class JointBandPolicy(nn.Module):
         return m_out, s_i, logp, w_cash, m_pre, s_pre
     
     @torch.no_grad()
+    def sample_m_only(self, obs: torch.Tensor):
+        """
+        m だけをサンプルして返す（Stage-1用）。
+        戻り値:
+        m_t   : 射影後センター [B,N]
+        logp_m: m の logprob 合計 [B]
+        m_pre : logprob再計算用（use_cash_softmax=Falseなら sigmoid後の(0,1)）[B,N]
+        """
+        B = obs.size(0); N = self.N
+        per, glob = self._build_tokens(obs)
+        cls_out, tok_out = self.body(per, glob)
+
+        m_mu = self.head_m(tok_out).squeeze(-1)   # [B,N]
+        std_m = torch.exp(self.log_std_m)
+        dist_m = torch.distributions.Normal(m_mu, std_m)
+
+        raw_m = dist_m.rsample()
+        m_i = torch.sigmoid(raw_m).clamp(1e-6, 1-1e-6)
+        m_t = project_simplex_leq1(m_i)
+
+        logJ_m = -(torch.log(m_i) + torch.log1p(-m_i))
+        logp_m = (dist_m.log_prob(raw_m) + logJ_m).sum(dim=1)
+
+        return m_t, logp_m, m_i.detach()
+    
+    @torch.no_grad()
     def sample_s_only(self, obs: torch.Tensor):
         """
         s だけを N(μ_s, σ_s)→sigmoid→(0,1) に写像してサンプル。
