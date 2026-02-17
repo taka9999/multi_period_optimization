@@ -2,6 +2,7 @@
 import os, json, random
 import copy
 from pathlib import Path
+from functools import partial
 
 import numpy as np
 import torch
@@ -9,7 +10,8 @@ import torch.optim as optim
 
 from src.ppo.update import ppo_update_joint
 from src.ppo.agent import JointBandPolicy, ValueNetCLS, PPOConfig
-from src.utils.training_utils import freeze_width_head_in_stage1,freeze_centers_in_stage2,make_market_sampler, MarketSamplerConfig
+from src.utils.training_utils import freeze_width_head_in_stage1,freeze_centers_in_stage2, make_market_sampler, MarketSamplerConfig
+
 from src.utils.rlopt_helpers import build_corr_from_pairs, build_cov
 from src.regime_gbm.gbm_env import globalsetting
 from src.ppo.rollout import rollout_joint
@@ -53,6 +55,118 @@ def load_regime_json(path: str, *, N: int):
     return regimes, P, dt
 
 
+def _proj_to_corr_psd(M: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """Symmetrize -> eigen clip -> renormalize to correlation (diag=1)."""
+    M = np.asarray(M, float)
+    M = 0.5 * (M + M.T)
+
+    # eigen clip to PSD
+    w, V = np.linalg.eigh(M)
+    w = np.clip(w, eps, None)
+    Mp = (V * w) @ V.T
+
+    # renormalize to correlation
+    d = np.sqrt(np.clip(np.diag(Mp), eps, None))
+    Mp = Mp / (d[:, None] * d[None, :])
+    Mp = np.clip(Mp, -0.999, 0.999)
+    np.fill_diagonal(Mp, 1.0)
+
+    # PSD guard again (tiny)
+    Mp = 0.5 * (Mp + Mp.T)
+    w2, V2 = np.linalg.eigh(Mp)
+    if np.min(w2) < eps:
+        w2 = np.clip(w2, eps, None)
+        Mp = (V2 * w2) @ V2.T
+        d = np.sqrt(np.clip(np.diag(Mp), eps, None))
+        Mp = Mp / (d[:, None] * d[None, :])
+        np.fill_diagonal(Mp, 1.0)
+    return Mp
+
+
+def _mix_corr(R_base: np.ndarray, rng: np.random.Generator,
+              noise_std: float,
+              mean_corr_shift: float = 0.0,
+              hi_cond: bool = False) -> np.ndarray:
+    """
+    - Add symmetric noise, keep diag=1.
+    - Optionally shift average correlation up/down (mean_corr_shift).
+    - Optionally create high condition-number structure (hi_cond=True).
+    """
+    N = R_base.shape[0]
+    R = np.array(R_base, float)
+
+    # 1) base mean-corr shift via shrinkage to/from rank-one
+    #    R' = (1-a)R + a*J  (J has ones everywhere -> high avg corr)
+    if mean_corr_shift != 0.0:
+        a = float(np.clip(mean_corr_shift, -0.95, 0.95))
+        J = np.ones((N, N), float)
+        np.fill_diagonal(J, 1.0)
+        if a > 0:
+            R = (1 - a) * R + a * J
+        else:
+            # negative shift: shrink toward identity (lower avg corr)
+            a2 = -a
+            I = np.eye(N)
+            R = (1 - a2) * R + a2 * I
+
+    # 2) noise
+    E = rng.normal(0.0, noise_std, size=(N, N))
+    E = 0.5 * (E + E.T)
+    np.fill_diagonal(E, 0.0)
+    R = R + E
+    np.fill_diagonal(R, 1.0)
+
+    # 3) optional high condition number: add a strong 1-factor component
+    if hi_cond:
+        v = rng.normal(size=N)
+        v /= (np.linalg.norm(v) + 1e-12)
+        # add factor vv^T (in corr space), then project back
+        strength = 0.8  # tune: bigger -> higher cond
+        R = (1 - strength) * R + strength * (np.outer(v, v))
+        np.fill_diagonal(R, 1.0)
+
+    return _proj_to_corr_psd(R)
+
+def market_sampler(rng: np.random.Generator, k: int, base_sigmas=None, base_R=None, globalcfg=None):
+    """
+    Returns:
+      R_ep:  (N,N) correlation matrix (PSD, diag=1)
+      sigmas_ep: (N,) positive vols
+    """
+    N = base_sigmas.size
+
+    # --- sigma: lognormal multiplicative noise ---
+    logstd = float(getattr(globalcfg, "REGIME_SIGMA_LOGSTD", 0.4))  # reuse your knob
+    z = rng.normal(0.0, logstd, size=N)
+    sig = base_sigmas * np.exp(z)
+
+    lo, hi = getattr(globalcfg, "REGIME_SIGMA_CLIP", (1e-4, 10.0))
+    sig = np.clip(sig, lo, hi)
+
+    # --- correlation: mixture of scenarios ---
+    # probabilities (tune)
+    p_hi_corr = 0.25
+    p_lo_corr = 0.25
+    p_hi_cond = 0.15
+    # rest: "normal"
+
+    u = rng.random()
+    noise_std = float(getattr(globalcfg, "REGIME_CORR_NOISE", 0.08))
+
+    if u < p_hi_corr:
+        # higher average correlation
+        R = _mix_corr(base_R, rng, noise_std=noise_std, mean_corr_shift=+0.5, hi_cond=False)
+    elif u < p_hi_corr + p_lo_corr:
+        # lower average correlation (more idiosyncratic)
+        R = _mix_corr(base_R, rng, noise_std=noise_std, mean_corr_shift=-0.5, hi_cond=False)
+    elif u < p_hi_corr + p_lo_corr + p_hi_cond:
+        # high condition number / factor dominance
+        R = _mix_corr(base_R, rng, noise_std=noise_std, mean_corr_shift=+0.2, hi_cond=True)
+    else:
+        # normal: small perturbation around base
+        R = _mix_corr(base_R, rng, noise_std=noise_std, mean_corr_shift=0.0, hi_cond=False)
+    return R, sig
+
 def main():
     # -------------------------
     # Config (same as notebook)
@@ -62,12 +176,11 @@ def main():
         device  = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         N_ASSETS = 5,
         years = 1,
-        sigmas   = np.array([0.25, 0.22, 0.28, 0.10, 0.18], dtype=float),
+        sigmas   = np.array([0.40, 0.30, 0.12, 0.22, 0.25], dtype=float),
         pair_rhos = {
-            (0,1): 0.22,
-            (0,2): 0.48,
-            (0,3): 0.25,
-            (0,4): -0.06,
+            (0,1): 0.60,
+            (1,3): -0.20,
+            (2,4): 0.05,
         },
         
         DISCOUNT_BY_BANK = True,
@@ -82,21 +195,20 @@ def main():
         MV_USE_TARGET = False,   # whether to use target return constraint in MV center
         RISK_GAMMA = 0.0,
         TARGET_ETA = 0.0,        # eta in hinge penalty eta*[target - mu^T w]_+
-        REGIME_GAMMA_ON_OBS = True,
+        REGIME_GAMMA_ON_OBS = False,
         OBS_BETA_ZERO = True,
 
         ROLL_COV_SUMMARY_ON_OBS = True,
         ROLL_OBS_LOOKBACK = 21,
-        ROLL_TOP_EIGS = 4,
-        ROLL_EWMA_HALFLIFE = 10,
+        ROLL_TOP_EIGS = 5,
         )
     
     # --- episode-level regime randomization ---
     # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.
-    globalcfg.REGIME_EPISODE_RANDOMIZE = True
-    globalcfg.REGIME_BETA_STD = 0.3        # std for beta perturbation
-    globalcfg.REGIME_SIGMA_LOGSTD = 0.5    # log-std for sigma multiplicative noise
-    globalcfg.REGIME_CORR_NOISE = 0.2      # additive noise on correlation matrix entries
+    globalcfg.REGIME_EPISODE_RANDOMIZE = False
+    globalcfg.REGIME_BETA_STD = 0.25        # std for beta perturbation
+    globalcfg.REGIME_SIGMA_LOGSTD = 0.4    # log-std for sigma multiplicative noise
+    globalcfg.REGIME_CORR_NOISE = 0.08      # additive noise on correlation matrix entries
     globalcfg.REGIME_BETA_CLIP = 0.999
     globalcfg.REGIME_SIGMA_CLIP = (1e-4, 10.0)
     set_seed(globalcfg.seed, globalcfg.device)
@@ -115,12 +227,12 @@ def main():
         batch_episodes=32,
         epochs=4,
         minibatch_size=4096,
-        lr_actor=1e-4,
-        lr_critic=1e-3,
-        lr_actor2=1e-4,
-        lr_critic2=5e-4,
-        clip_ratio=0.3,
-        entropy_coef=0.2,
+        lr_actor=1e-3,
+        lr_critic=5e-3,
+        lr_actor2=1e-3,
+        lr_critic2=5e-3,
+        clip_ratio=0.7,
+        entropy_coef=0.5,
         vf_coef=0.5,
         max_grad_norm=0.5,
     )
@@ -196,7 +308,7 @@ def main():
 
     opt_pi = optim.Adam(policy.parameters(), lr=cfg.lr_actor)
     opt_v  = optim.Adam(value.parameters(),  lr=cfg.lr_critic)
-
+    
     BASE_SIGMAS = np.asarray(globalcfg.sigmas, float).reshape(-1)
     BASE_R = np.asarray(R_base, float)
 
@@ -211,7 +323,7 @@ def main():
     #  Stage 1: frictionless (λ=1.0, tiny width)
     # -------------------------
     print("[Stage 1] warmup (beta -> m)")
-    policy.use_cash_softmax = True
+    policy.use_cash_softmax = False
     freeze_width_head_in_stage1(policy)
     for it in range(6):
         batch = rollout_joint(policy, value, cfg,
@@ -255,10 +367,11 @@ def main():
                 target_choices=target_choices,
                 stage=2,
                 R=R_base,
+                center_mode="policy",
                 market_sampler=market_sampler_fn,
                 env_ctor=env_ctor,
             )
-            ppo_update_joint(policy, value, opt_pi, opt_v, cfg, batch, env_cfg=globalcfg, stage=2, width_prior_w=0.02)
+            ppo_update_joint(policy, value, opt_pi, opt_v, cfg, batch, env_cfg=globalcfg, stage=2, width_prior_w=0.00)
             if (it+1) % 2 == 0:
                 print(f"  upd {it+1:02d}: mean_annual_ret={batch['rew_ep_mean']/globalcfg.years:.4f}")
 

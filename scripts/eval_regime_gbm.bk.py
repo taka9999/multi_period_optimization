@@ -437,8 +437,6 @@ def frontier_compare_regime(
     policy_nlayers: int = 2,
     policy_nhead: int = 4,
     policy_use_cash_softmax: bool = True,
-    policy_global_dim: Optional[int] = None,
-    policy_per_dim: Optional[int] = None,
 ) -> Tuple[Dict[str, Dict[float, Tuple[float, float]]],
            Dict[str, Dict[float, Tuple[float, float]]],
            Dict[str, Dict[float, List[Dict[str, Tuple[float, float]]]]],
@@ -448,9 +446,9 @@ def frontier_compare_regime(
     strategies = ["MV_daily_frictionless", "MV_monthly_cost", "RL_band"]
     raw: Dict[str, Dict[float, List[Dict[str, Tuple[float, float]]]]] = {s: {float(t): [] for t in targets} for s in strategies}
     skipped: Dict[str, Dict[float, int]] = {s: {float(t): 0 for t in targets} for s in strategies}
+
     # serialize policy for workers
     policy_state = {k: v.detach().cpu() for k, v in policy.state_dict().items()}
-
     # NOTE: JointBandPolicy may not expose architectural params as attributes.
     # We therefore rely on explicit args to reconstruct the model in each worker.
     policy_kwargs = dict(
@@ -459,8 +457,6 @@ def frontier_compare_regime(
         nlayers=int(policy_nlayers),
         nhead=int(policy_nhead),
         use_cash_softmax=bool(policy_use_cash_softmax),
-        global_dim=int(policy_global_dim) if policy_global_dim is not None else int(getattr(policy, "global_dim", 4)),
-        per_dim=int(policy_per_dim) if policy_per_dim is not None else int(getattr(policy, "per_dim", 5)),
     )
 
     # serialize gcfg for workers (dataclass-like)
@@ -468,33 +464,23 @@ def frontier_compare_regime(
         seed=int(gcfg.seed),
         device=gcfg.device,
         N_ASSETS=int(gcfg.N_ASSETS),
-        years=float(getattr(gcfg, "years", 1.0)),
-        dt_day=float(getattr(gcfg, "dt_day", 1/252)),
-        T_days=int(getattr(gcfg, "T_days", T_days)),
-        r=float(getattr(gcfg, "r", 0.02)),
         sigmas=np.asarray(getattr(gcfg, "sigmas", np.ones(gcfg.N_ASSETS))).astype(float),
         pair_rhos=getattr(gcfg, "pair_rhos", {}),
-
         DISCOUNT_BY_BANK=bool(getattr(gcfg, "DISCOUNT_BY_BANK", True)),
         INIT_W0_UNIFORM=bool(getattr(gcfg, "INIT_W0_UNIFORM", True)),
         BAND_SMOOTH_COEF=float(getattr(gcfg, "BAND_SMOOTH_COEF", 0.0)),
         TRADE_PEN_COEF=float(getattr(gcfg, "TRADE_PEN_COEF", 0.4)),
         ALPHA=float(getattr(gcfg, "ALPHA", 1/5)),
         STAGE1_WIDTH_COEF=float(getattr(gcfg, "STAGE1_WIDTH_COEF", 0.05)),
-
-        # obs flags / dims (critical to match checkpoints)
-        REGIME_GAMMA_ON_OBS=bool(getattr(gcfg, "REGIME_GAMMA_ON_OBS", False)),
-        OBS_BETA_ZERO=bool(getattr(gcfg, "OBS_BETA_ZERO", False)),
-        ROLL_COV_SUMMARY_ON_OBS=bool(getattr(gcfg, "ROLL_COV_SUMMARY_ON_OBS", False)),
-        ROLL_OBS_LOOKBACK=int(getattr(gcfg, "ROLL_OBS_LOOKBACK", 63)),
-        ROLL_TOP_EIGS=int(getattr(gcfg, "ROLL_TOP_EIGS", 0)),
-        ROLL_EWMA_HALFLIFE=int(getattr(gcfg, "ROLL_EWMA_HALFLIFE", 21)),
-        ROLL_DOWNSIDE_DEV_ON_OBS=bool(getattr(gcfg, "ROLL_DOWNSIDE_DEV_ON_OBS", False)),
-        ROLL_DOWNSIDE_USE_TARGET=bool(getattr(gcfg, "ROLL_DOWNSIDE_USE_TARGET", False)),
-        PER_ASSET_DIM=int(getattr(gcfg, "PER_ASSET_DIM", 5)),
-        ROLL_GLOBAL_DIM=int(getattr(gcfg, "ROLL_GLOBAL_DIM", 0)),
     )
 
+    #seeds = [base_seed + i for i in range(int(n_eps))]
+    #jobs = [
+    #    (seed, targets.tolist(), lam_cost, T_days, mv_solver, infeasible_policy,
+    #     str(cache_dir), gcfg_dict, regimes, P, policy_state, policy_kwargs,bool(verbose),)
+    #    for seed in seeds
+    #]
+    
     jobs = []
     # Define the single "verbose" (seed, target) once, and pass to all workers
     base_seed_int = int(base_seed)
@@ -719,51 +705,7 @@ def build_gcfg(device: torch.device, N: int, seed: int) -> Any:
         TRADE_PEN_COEF=0.4,
         ALPHA=1/5,
         STAGE1_WIDTH_COEF=0.05,
-
-        # default obs flags (may be overwritten from checkpoint dims)
-        REGIME_GAMMA_ON_OBS=False,
-        OBS_BETA_ZERO=False,
-        ROLL_COV_SUMMARY_ON_OBS=True,
-        ROLL_OBS_LOOKBACK=63,
-        ROLL_TOP_EIGS=2,
-        ROLL_EWMA_HALFLIFE=21,
-        ROLL_DOWNSIDE_DEV_ON_OBS=False,
-        ROLL_DOWNSIDE_USE_TARGET=False,
     )
-
-
-def _infer_policy_obs_dims_from_state_dict(sd: Dict[str, torch.Tensor]) -> Tuple[int, int]:
-    """Infer (per_dim, global_dim) from a JointBandPolicy checkpoint.
-
-    We rely on the linear input projections:
-      - body.token_enc.weight: [d_model, per_dim]
-      - body.glob_proj.weight: [d_model, global_dim]
-    """
-    if "body.token_enc.weight" not in sd or "body.glob_proj.weight" not in sd:
-        return 5, 4
-    per_dim_ckpt = int(sd["body.token_enc.weight"].shape[1])
-    global_dim_ckpt = int(sd["body.glob_proj.weight"].shape[1])
-    return per_dim_ckpt, global_dim_ckpt
-
-
-def _apply_obs_flags_from_dims(gcfg: Any, *, per_dim: int, global_dim: int, K: int) -> None:
-    """Set env observation flags so that RegimeGBMBandEnvMulti emits obs matching the checkpoint."""
-    gcfg.PER_ASSET_DIM = int(per_dim)
-    gcfg.ROLL_COV_SUMMARY_ON_OBS = bool(per_dim >= 7)
-
-    gamma_on = bool(K > 0 and global_dim >= 4 + K)
-    gcfg.REGIME_GAMMA_ON_OBS = gamma_on
-
-    base = 4 + (K if gamma_on else 0)
-    roll_extra = max(0, int(global_dim) - int(base))
-    if roll_extra > 0:
-        gcfg.ROLL_COV_SUMMARY_ON_OBS = True
-        # Compatibility with finetune/train convention (no downside-dev feature in global_dim).
-        gcfg.ROLL_DOWNSIDE_DEV_ON_OBS = False
-        gcfg.ROLL_TOP_EIGS = max(0, roll_extra - 2)
-    else:
-        gcfg.ROLL_TOP_EIGS = 0
-        gcfg.ROLL_DOWNSIDE_DEV_ON_OBS = False
 
 
 def load_policy(
@@ -775,28 +717,12 @@ def load_policy(
     nlayers: int = 2,
     nhead: int = 4,
     use_cash_softmax: bool = True,
-    per_dim: Optional[int] = None,
-    global_dim: Optional[int] = None,
-) -> Tuple[JointBandPolicy, int, int]:
-    """Load policy checkpoint, instantiating with the correct obs dims."""
+) -> JointBandPolicy:
+    pol = JointBandPolicy(N, d_model=d_model, nlayers=nlayers, nhead=nhead, use_cash_softmax=use_cash_softmax).to(device)
     sd = torch.load(policy_path, map_location=device)
-
-    per_dim_ckpt, global_dim_ckpt = _infer_policy_obs_dims_from_state_dict(sd)
-    per_dim_use = int(per_dim_ckpt if per_dim is None else per_dim)
-    global_dim_use = int(global_dim_ckpt if global_dim is None else global_dim)
-
-    pol = JointBandPolicy(
-        N,
-        d_model=d_model,
-        nlayers=nlayers,
-        nhead=nhead,
-        use_cash_softmax=use_cash_softmax,
-        global_dim=global_dim_use,
-        per_dim=per_dim_use,
-    ).to(device)
     pol.load_state_dict(sd, strict=True)
     pol.eval()
-    return pol, per_dim_use, global_dim_use
+    return pol
 
 def plot_wealth_compare_two_policies(
     *,
@@ -978,37 +904,29 @@ def main() -> None:
     use_cash = bool(args.policy_use_cash_softmax) and (not bool(args.policy_no_cash_softmax))
 
 
-# ------------------------------------------------------------
-# Load policy checkpoint(s) and sync env obs flags to match them
-# ------------------------------------------------------------
-K = int(len(regimes)) if regimes is not None else 0
-
-# policy A
-policy_A, per_dim_A, global_dim_A = load_policy(
-    args.policy_path,
-    N=int(args.N),
-    device=device,
-    d_model=args.policy_d_model,
-    nlayers=args.policy_nlayers,
-    nhead=args.policy_nhead,
-    use_cash_softmax=bool(use_cash),
-)
-_apply_obs_flags_from_dims(gcfg, per_dim=per_dim_A, global_dim=global_dim_A, K=K)
-
-# optional policy B (force same dims as A, to keep the evaluation comparable)
-policy_B = None
-if args.policy_path_B:
-    policy_B, per_dim_B, global_dim_B = load_policy(
-        args.policy_path_B,
+    # policy A
+    policy_A = load_policy(
+        args.policy_path,
         N=int(args.N),
         device=device,
         d_model=args.policy_d_model,
         nlayers=args.policy_nlayers,
         nhead=args.policy_nhead,
         use_cash_softmax=bool(use_cash),
-        per_dim=per_dim_A,
-        global_dim=global_dim_A,
     )
+
+    # optional policy B
+    policy_B = None
+    if args.policy_path_B:
+        policy_B = load_policy(
+            args.policy_path_B,
+            N=int(args.N),
+            device=device,
+            d_model=args.policy_d_model,
+            nlayers=args.policy_nlayers,
+            nhead=args.policy_nhead,
+            use_cash_softmax=bool(use_cash),
+        )
 
     outroot = Path(args.outdir)
     outroot.mkdir(parents=True, exist_ok=True)
@@ -1049,8 +967,6 @@ if args.policy_path_B:
           policy_nlayers=int(args.policy_nlayers),
           policy_nhead=int(args.policy_nhead),
           policy_use_cash_softmax=bool(use_cash),
-          policy_global_dim=int(global_dim_A),
-          policy_per_dim=int(per_dim_A),
           verbose=bool(args.verbose),
           )
     summary_A = {"args": vars(args), "label": args.label_A, "policy_path": args.policy_path, "skipped": info_A["skipped"]}
@@ -1113,8 +1029,6 @@ if args.policy_path_B:
              policy_nlayers=int(args.policy_nlayers),
              policy_nhead=int(args.policy_nhead),
              policy_use_cash_softmax=bool(use_cash),
-             policy_global_dim=int(global_dim_A),
-             policy_per_dim=int(per_dim_A),
              verbose=bool(args.verbose),
          )
  

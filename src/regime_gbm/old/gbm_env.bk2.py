@@ -48,7 +48,6 @@ class globalsetting:
     ROLL_COV_SUMMARY_ON_OBS:bool = True
     ROLL_OBS_LOOKBACK: int = 63
     ROLL_TOP_EIGS: int = 2
-    ROLL_EWMA_HALFLIFE : int = 21
 
     # === downside deviation (portfolio realized) ===
     # Add one global feature ddp (annualized-like downside deviation of realized portfolio log-return)
@@ -123,7 +122,7 @@ def reflect_multi(S: np.ndarray,
     w = S / (Y + 1e-30)
 
     # iterate re-allocation until no progress
-    for _ in range(10):  # 10回も回せば十分
+    for _ in range(10):
         gaps = np.maximum(0.0, A - w)
         need = gaps * Y
         total_need = need.sum()
@@ -397,7 +396,7 @@ def project_rotated_box_qp(
     b_z: np.ndarray,
     *,
     allow_cash: bool = True,
-    solver: str = "SCS",
+    solver: str = "OSQP",
 ) -> np.ndarray:
     """
     Projection of w onto rotated box:
@@ -659,69 +658,27 @@ class GBMBandEnvMulti:
         mu_hat = np.zeros(self.N, dtype=float)
         roll_global = None
 
-        #if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
-        #    lb   = int(getattr(self.cfg, "ROLL_OBS_LOOKBACK", 63))
-        #    topk = int(getattr(self.cfg, "ROLL_TOP_EIGS", 2))
-
-        #    Cov_hat = None
-        #    if hasattr(self, "_ret_hist") and len(self._ret_hist) >= 2:
-        #        window = np.asarray(self._ret_hist[-lb:], float)  # [L, N]
-        #        if window.shape[0] >= 2:
-        #            Cov_hat = np.cov(window, rowvar=False, ddof=1) / max(self.dt, 1e-12)  # annualized
-
-        #    if Cov_hat is None or (not np.all(np.isfinite(Cov_hat))):
-        #        Cov_hat = self.Cov
-
-        #    diag = np.clip(np.diag(Cov_hat), 0.0, None)
-        #    sigma_hat = np.sqrt(diag)
-
-        #    if hasattr(self, "_ret_hist") and len(self._ret_hist) >= 2:
-        #        window = np.asarray(self._ret_hist[-lb:], float)  # [L,N] ここは rlog を積んでる
-        #        if window.shape[0] >= 2:
-        #            mu_hat = window.mean(axis=0) / max(self.dt, 1e-12)   # annualized drift
         if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
             lb   = int(getattr(self.cfg, "ROLL_OBS_LOOKBACK", 63))
             topk = int(getattr(self.cfg, "ROLL_TOP_EIGS", 2))
 
-            window = None
+            Cov_hat = None
             if hasattr(self, "_ret_hist") and len(self._ret_hist) >= 2:
-                window = np.asarray(self._ret_hist[-lb:], float)  # [L, N] log-returns
+                window = np.asarray(self._ret_hist[-lb:], float)  # [L, N]
+                if window.shape[0] >= 2:
+                    Cov_hat = np.cov(window, rowvar=False, ddof=1) / max(self.dt, 1e-12)  # annualized
 
-            if window is None or window.shape[0] < 2:
+            if Cov_hat is None or (not np.all(np.isfinite(Cov_hat))):
                 Cov_hat = self.Cov
-                mu_hat  = np.zeros(self.N, dtype=float)
-            else:
-                L, N = window.shape
-
-                # --- choose alpha via half-life (more interpretable) ---
-                # half-life h (in steps): weight halves every h steps
-                h = float(getattr(self.cfg, "ROLL_EWMA_HALFLIFE", 21))  # e.g. 21 trading days
-                alpha = 1.0 - np.exp(np.log(0.5) / max(h, 1e-12))
-                alpha = float(np.clip(alpha, 1e-4, 0.5))
-
-                # initialize with last obs or sample estimates
-                m = window[0].copy()
-                S = np.zeros((N, N), dtype=float)
-
-                for t in range(L):
-                    r = window[t]
-                    # mean
-                    m = (1.0 - alpha) * m + alpha * r
-                    # cov (centered)
-                    x = (r - m).reshape(N, 1)
-                    S = (1.0 - alpha) * S + alpha * (x @ x.T)
-
-                Cov_hat = S / max(self.dt, 1e-12)  # annualized
-                mu_hat  = m / max(self.dt, 1e-12)  # annualized drift
-
-                # safety
-                Cov_hat = 0.5 * (Cov_hat + Cov_hat.T)
-                # (optional) tiny jitter for numerical stability
-                eps = 1e-12
-                Cov_hat = Cov_hat + eps * np.eye(N)
 
             diag = np.clip(np.diag(Cov_hat), 0.0, None)
             sigma_hat = np.sqrt(diag)
+
+            if hasattr(self, "_ret_hist") and len(self._ret_hist) >= 2:
+                window = np.asarray(self._ret_hist[-lb:], float)  # [L,N] ここは rlog を積んでる
+                if window.shape[0] >= 2:
+                    mu_hat = window.mean(axis=0) / max(self.dt, 1e-12)   # annualized drift
+
 
             # global summaries
             tr = float(np.trace(Cov_hat))
@@ -902,7 +859,7 @@ class GBMBandEnvMulti:
         U: np.ndarray,
         b_z: np.ndarray,
         *,
-        allow_cash: bool = True,
+        allow_cash: bool = False,
         solver: str = "SCS",
         use_trade_penalty: bool = False,
         ):

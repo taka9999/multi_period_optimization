@@ -1,3 +1,7 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable, Tuple, Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -5,6 +9,145 @@ import torch.nn as nn
 from src.regime_gbm.gbm_env import globalsetting
 from src.ppo.agent import JointBandPolicy, ValueNetCLS, PPOConfig
 from src.utils.rlopt_helpers  import build_corr_from_pairs
+
+@dataclass
+class MarketSamplerConfig:
+    # sigma
+    sigma_logstd: float = 0.4
+    sigma_clip: tuple = (1e-4, 10.0)
+
+    # corr noise
+    corr_noise_std: float = 0.08
+
+    # mixture probs
+    p_hi_corr: float = 0.25
+    p_lo_corr: float = 0.25
+    p_hi_cond: float = 0.15
+
+    # scenario strengths
+    mean_corr_shift_hi: float = 0.5
+    mean_corr_shift_lo: float = -0.5
+    mean_corr_shift_hi_cond: float = 0.2
+    cond_factor_strength: float = 0.8
+
+
+def _proj_to_corr_psd(M: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    M = np.asarray(M, float)
+    M = 0.5 * (M + M.T)
+
+    w, V = np.linalg.eigh(M)
+    w = np.clip(w, eps, None)
+    Mp = (V * w) @ V.T
+
+    d = np.sqrt(np.clip(np.diag(Mp), eps, None))
+    Mp = Mp / (d[:, None] * d[None, :])
+    Mp = np.clip(Mp, -0.999, 0.999)
+    np.fill_diagonal(Mp, 1.0)
+
+    # PSD guard again
+    Mp = 0.5 * (Mp + Mp.T)
+    w2, V2 = np.linalg.eigh(Mp)
+    if np.min(w2) < eps:
+        w2 = np.clip(w2, eps, None)
+        Mp = (V2 * w2) @ V2.T
+        d = np.sqrt(np.clip(np.diag(Mp), eps, None))
+        Mp = Mp / (d[:, None] * d[None, :])
+        np.fill_diagonal(Mp, 1.0)
+    return Mp
+
+
+def _mix_corr(
+    R_base: np.ndarray,
+    rng: np.random.Generator,
+    noise_std: float,
+    mean_corr_shift: float = 0.0,
+    hi_cond: bool = False,
+    cond_factor_strength: float = 0.8,
+) -> np.ndarray:
+    N = R_base.shape[0]
+    R = np.array(R_base, float)
+
+    # shift avg corr up/down
+    if mean_corr_shift != 0.0:
+        a = float(np.clip(mean_corr_shift, -0.95, 0.95))
+        if a > 0:
+            J = np.ones((N, N), float)
+            np.fill_diagonal(J, 1.0)
+            R = (1 - a) * R + a * J
+        else:
+            a2 = -a
+            I = np.eye(N)
+            R = (1 - a2) * R + a2 * I
+
+    # symmetric noise
+    E = rng.normal(0.0, noise_std, size=(N, N))
+    E = 0.5 * (E + E.T)
+    np.fill_diagonal(E, 0.0)
+    R = R + E
+    np.fill_diagonal(R, 1.0)
+
+    # high condition number via 1-factor component
+    if hi_cond:
+        v = rng.normal(size=N)
+        v /= (np.linalg.norm(v) + 1e-12)
+        strength = float(np.clip(cond_factor_strength, 0.0, 0.95))
+        R = (1 - strength) * R + strength * np.outer(v, v)
+        np.fill_diagonal(R, 1.0)
+
+    return _proj_to_corr_psd(R)
+
+
+def make_market_sampler(
+    base_sigmas: np.ndarray,
+    base_R: np.ndarray,
+    cfg: Optional[MarketSamplerConfig] = None,
+) -> Callable[[np.random.Generator, int], Tuple[np.ndarray, np.ndarray]]:
+    """
+    Returns a callable market_sampler(rng, k) -> (R_ep, sigmas_ep)
+    """
+    base_sigmas = np.asarray(base_sigmas, float).reshape(-1)
+    base_R = np.asarray(base_R, float)
+    N = base_sigmas.size
+
+    if cfg is None:
+        cfg = MarketSamplerConfig()
+
+    def sampler(rng: np.random.Generator, k: int):
+        # sigma: lognormal
+        z = rng.normal(0.0, float(cfg.sigma_logstd), size=N)
+        sig = base_sigmas * np.exp(z)
+        lo, hi = cfg.sigma_clip
+        sig = np.clip(sig, lo, hi)
+
+        # corr: mixture
+        u = rng.random()
+        noise_std = float(cfg.corr_noise_std)
+
+        if u < cfg.p_hi_corr:
+            R = _mix_corr(base_R, rng, noise_std=noise_std,
+                         mean_corr_shift=cfg.mean_corr_shift_hi,
+                         hi_cond=False,
+                         cond_factor_strength=cfg.cond_factor_strength)
+        elif u < cfg.p_hi_corr + cfg.p_lo_corr:
+            R = _mix_corr(base_R, rng, noise_std=noise_std,
+                         mean_corr_shift=cfg.mean_corr_shift_lo,
+                         hi_cond=False,
+                         cond_factor_strength=cfg.cond_factor_strength)
+        elif u < cfg.p_hi_corr + cfg.p_lo_corr + cfg.p_hi_cond:
+            R = _mix_corr(base_R, rng, noise_std=noise_std,
+                         mean_corr_shift=cfg.mean_corr_shift_hi_cond,
+                         hi_cond=True,
+                         cond_factor_strength=cfg.cond_factor_strength)
+        else:
+            R = _mix_corr(base_R, rng, noise_std=noise_std,
+                         mean_corr_shift=0.0,
+                         hi_cond=False,
+                         cond_factor_strength=cfg.cond_factor_strength)
+
+        return R, sig
+
+    return sampler
+
 
 def warmup_joint_beta_to_m(
     policy: JointBandPolicy,

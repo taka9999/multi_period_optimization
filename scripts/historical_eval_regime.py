@@ -2165,7 +2165,7 @@ if __name__ == "__main__":
 
         ROLL_COV_SUMMARY_ON_OBS = True,
         ROLL_OBS_LOOKBACK = 21,
-        ROLL_TOP_EIGS = 2,
+        ROLL_TOP_EIGS = 5,
     )
     # --- episode-level regime randomization ---
     # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.

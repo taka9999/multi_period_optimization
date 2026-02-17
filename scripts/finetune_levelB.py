@@ -11,7 +11,7 @@ import torch
 
 from src.ppo.agent import JointBandPolicy, ValueNetCLS, PPOConfig
 from src.ppo.update import ppo_update_joint
-from src.utils.training_utils import freeze_centers_in_stage2
+from src.utils.training_utils import freeze_width_head_in_stage1,freeze_centers_in_stage2, make_market_sampler, MarketSamplerConfig
 from src.ppo.rollout import rollout_joint_levelB, rollout_eval_levelB
 
 from src.regime_gbm.gbm_env import globalsetting
@@ -42,51 +42,6 @@ def _load_state_dict_shape_safe(model: torch.nn.Module, state_dict: Dict[str, to
         "missing": list(msg.missing_keys),
         "unexpected": list(msg.unexpected_keys),
     }
-
-
-# ------------------------------
-# Domain randomization utilities
-# ------------------------------
-def make_market_sampler(
-    gcfg: globalsetting,
-    *,
-    rho_range: tuple[float, float] = (-0.2, 0.8),
-    pair_rho_noise: float = 0.15,
-    sigma_logn_std: float = 0.20,
-    sigma_clip: tuple[float, float] = (0.05, 0.60),
-):
-    """Return a callable market_sampler(rng, k) -> (R, sigmas).
-
-    - Samples a correlation matrix via your `build_corr_from_pairs(..., make_psd=True)`.
-    - Samples per-asset vol as log-normal around the base `gcfg.sigmas`.
-
-    This sampler is designed to be plugged into Rollout_HJB_box_B2.rollout_* via
-    the `market_sampler=` keyword.
-    """
-    N = int(gcfg.N_ASSETS)
-    base_sigmas = np.asarray(gcfg.sigmas, float).reshape(-1)
-    base_pairs = getattr(gcfg, "pair_rhos", None)
-
-    def _sampler(rng: np.random.Generator, k: int):
-        # --- R ---
-        base_rho = float(rng.uniform(rho_range[0], rho_range[1]))
-        if base_pairs is None:
-            pair_rhos = None
-        else:
-            # perturb each provided pair rho, then clip
-            pair_rhos = {}
-            for key, val in dict(base_pairs).items():
-                pv = float(val) + float(rng.normal(0.0, pair_rho_noise))
-                pair_rhos[key] = float(np.clip(pv, -0.95, 0.95))
-
-        R = build_corr_from_pairs(N, base_rho=base_rho, pair_rhos=pair_rhos, make_psd=True)
-
-        # --- sigmas ---
-        mult = np.exp(rng.normal(0.0, sigma_logn_std, size=N))
-        sigmas = np.clip(base_sigmas * mult, sigma_clip[0], sigma_clip[1])
-        return R, sigmas
-
-    return _sampler
 
 def _trainable_param_stats(model):
     n_train = 0
@@ -240,24 +195,28 @@ def make_regime_env_ctor(
         for j, r in enumerate(regimes0):
             rr = dict(r)
             rr["beta"] = np.asarray(rr["beta"], float).reshape(-1)
-            rr["sigmas"] = (np.asarray(rr["sigmas"], float).reshape(-1) * mult)
-            rr["R"] = R_new
-            sig_base_reg = np.asarray(rr["sigmas"], float).reshape(-1)
+            #rr["sigmas"] = (np.asarray(rr["sigmas"], float).reshape(-1) * mult)
+            #rr["R"] = R_new
+            #sig_base_reg = np.asarray(rr["sigmas"], float).reshape(-1)
 
-            if market_sampler is not None:
+            #if market_sampler is not None:
                 # regime-specific sampling (R_j, sig_j) per episode
                 # use different rng stream per regime for reproducibility
-                key = int(kk) * 1000 + int(j)
-                rng_j = np.random.default_rng(int(base_seed) + key)
-                Rj, sigj = market_sampler(rng_j, key)
-                Rj = np.asarray(Rj, float)
-                sigj = np.asarray(sigj, float).reshape(-1)
-                mult_j = sigj / base_sigmas_env
-                rr["sigmas"] = sig_base_reg * mult_j
-                rr["R"] = Rj
-            else:
-                rr["sigmas"] = sig_base_reg
-                rr["R"] = R_fallback
+            #    key = int(kk) * 1000 + int(j)
+            #    rng_j = np.random.default_rng(int(base_seed) + key)
+            #    Rj, sigj = market_sampler(rng_j, key)
+            #    Rj = np.asarray(Rj, float)
+            #    sigj = np.asarray(sigj, float).reshape(-1)
+            #    mult_j = sigj / base_sigmas_env
+            #    rr["sigmas"] = sig_base_reg * mult_j
+            #    rr["R"] = Rj
+            #else:
+            #    rr["sigmas"] = sig_base_reg
+            #    rr["R"] = R_fallback
+            # Episode-wise: share a single (R_new, mult) across regimes.
+            # Keeps time-series stable and avoids regime-by-regime random R inside same episode.
+            rr["sigmas"] = (np.asarray(rr["sigmas"], float).reshape(-1) * mult)
+            rr["R"] = R_new
             regimes_ep.append(rr)
 
         return RegimeGBMBandEnvMulti(cfg=gcfg, regimes=regimes_ep, P=P, R=R_new)
@@ -401,7 +360,9 @@ def finetune_stage2_levelB(
     # --- domain randomization sampler (used during training rollouts) ---
     if domain_randomize:
         if market_sampler is None:
-            market_sampler = make_market_sampler(gcfg)
+            # NOTE: prefer explicit base (sigmas, R) construction outside when possible.
+            # Here we keep fallback for backward-compat if caller didn't pass a sampler.
+            market_sampler = make_market_sampler(np.asarray(gcfg.sigmas, float), np.eye(int(gcfg.N_ASSETS)))
     else:
         market_sampler = None
 
@@ -410,7 +371,7 @@ def finetune_stage2_levelB(
 
     # default sampler (if requested)
     if domain_randomize and market_sampler is None:
-        market_sampler = make_market_sampler(gcfg)
+        market_sampler = make_market_sampler(np.asarray(gcfg.sigmas, float), np.eye(int(gcfg.N_ASSETS)))
 
     fixed_cases = make_fixed_eval_cases(
     sigmas = gcfg.sigmas,
@@ -624,12 +585,14 @@ if __name__ == "__main__":
         device  = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         N_ASSETS = 5,
         years = 1,
-        sigmas   = np.array([0.40, 0.30, 0.12, 0.22, 0.25], dtype=float),
+        sigmas   = np.array([0.25, 0.22, 0.28, 0.10, 0.18], dtype=float),
         pair_rhos = {
-            (0,1): 0.60,
-            (1,3): -0.20,
-            (2,4): 0.05,
+            (0,1): 0.22,
+            (0,2): 0.48,
+            (0,3): 0.25,
+            (0,4): -0.06,
         },
+
 
         DISCOUNT_BY_BANK = True,
         INIT_W0_UNIFORM = True,
@@ -643,19 +606,38 @@ if __name__ == "__main__":
         MV_USE_TARGET = False,   # whether to use target return constraint in MV center
         RISK_GAMMA = 0.0,
         TARGET_ETA = 0.0,        # eta in hinge penalty eta*[target - mu^T w]_+
-        REGIME_GAMMA_ON_OBS = False,
-        OBS_BETA_ZERO = False,
+        REGIME_GAMMA_ON_OBS = True,
+        OBS_BETA_ZERO = True,
 
         ROLL_COV_SUMMARY_ON_OBS = True,
         ROLL_OBS_LOOKBACK = 21,
-        ROLL_TOP_EIGS = 2,
+        ROLL_TOP_EIGS = 3,
+        ROLL_EWMA_HALFLIFE = 10,
     )
+
+    cfg = PPOConfig(
+        horizon=gcfg.T_days,
+        gamma=1.0,
+        gae_lambda=1.0,
+        batch_episodes=32,
+        epochs=4,
+        minibatch_size=4096,
+        lr_actor=1e-4,
+        lr_critic=1e-3,
+        lr_actor2=1e-4,
+        lr_critic2=1e-3,
+        clip_ratio=0.5,
+        entropy_coef=0.3,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+    )
+
     # --- episode-level regime randomization ---
     # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.
     gcfg.REGIME_EPISODE_RANDOMIZE = True
-    gcfg.REGIME_BETA_STD = 0.25        # std for beta perturbation
-    gcfg.REGIME_SIGMA_LOGSTD = 0.4    # log-std for sigma multiplicative noise
-    gcfg.REGIME_CORR_NOISE = 0.08      # additive noise on correlation matrix entries
+    gcfg.REGIME_BETA_STD = 0.3        # std for beta perturbation
+    gcfg.REGIME_SIGMA_LOGSTD = 0.5    # log-std for sigma multiplicative noise
+    gcfg.REGIME_CORR_NOISE = 0.2      # additive noise on correlation matrix entries
     gcfg.REGIME_BETA_CLIP = 0.999
     gcfg.REGIME_SIGMA_CLIP = (1e-4, 10.0)
     gcfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -678,11 +660,35 @@ if __name__ == "__main__":
         # non-regime: Corr matrix (same as your training setup)
         R = build_corr_from_pairs(gcfg.N_ASSETS, base_rho=0.20, pair_rhos=gcfg.pair_rhos, make_psd=True)
         env_ctor = None
-        market_sampler = make_market_sampler(gcfg)  # non-regime uses rollout-side sampler
+        BASE_SIGMAS = np.asarray(gcfg.sigmas, float).reshape(-1)
+        BASE_R = np.asarray(R, float)
+
+        ms_cfg = MarketSamplerConfig(
+            sigma_logstd=float(getattr(gcfg, "REGIME_SIGMA_LOGSTD", 1.0)),
+            sigma_clip=tuple(getattr(gcfg, "REGIME_SIGMA_CLIP", (1e-4, 10.0))),
+            corr_noise_std=float(getattr(gcfg, "REGIME_CORR_NOISE", 0.1)),
+        )
+        market_sampler = make_market_sampler(BASE_SIGMAS, BASE_R, cfg=ms_cfg)
     else:
         # regime: env_ctor injects RegimeGBMBandEnvMulti
         # randomize inside env_ctor (episode-wise)
-        market_sampler = make_market_sampler(gcfg) if args.corr_randomize else None
+        # Use the SAME sampler factory as train: based on a base (sigmas, R).
+        # For base_R, use regimes[0].R if present; else identity.
+        if args.corr_randomize:
+            reg0 = _ensure_regime_arrays(regimes)[0]
+            base_R = reg0.get("R", None)
+            if base_R is None:
+                base_R = np.eye(gcfg.N_ASSETS, dtype=float)
+            BASE_SIGMAS = np.asarray(gcfg.sigmas, float).reshape(-1)
+            BASE_R = np.asarray(base_R, float)
+            ms_cfg = MarketSamplerConfig(
+                sigma_logstd=float(getattr(gcfg, "REGIME_SIGMA_LOGSTD", 0.4)),
+                sigma_clip=tuple(getattr(gcfg, "REGIME_SIGMA_CLIP", (1e-4, 10.0))),
+                corr_noise_std=float(getattr(gcfg, "REGIME_CORR_NOISE", 0.08)),
+            )
+            market_sampler = make_market_sampler(BASE_SIGMAS, BASE_R, cfg=ms_cfg)
+        else:
+            market_sampler = None
         env_ctor = make_regime_env_ctor(regimes, P, gcfg, market_sampler=market_sampler, base_seed=1234)
 
         # Rollout 側の API 的に R が必要な箇所があるのでダミーを渡す
@@ -699,11 +705,6 @@ if __name__ == "__main__":
         gcfg.REGIME_GAMMA_ON_OBS = True
         K = int(len(regimes))
     gcfg.OBS_BETA_ZERO = False
-
-    cfg = PPOConfig()
-    cfg.batch_episodes = 16
-    cfg.epochs = 4
-    cfg.minibatch_size = 2048
 
     # ------------------------------------------------------------
     # Infer obs dims from checkpoint (MOST ROBUST)
@@ -751,22 +752,6 @@ if __name__ == "__main__":
     # Optional fixed center policy (A2): same dims as its ckpt
     # ------------------------------------------------------------
     center_policy = None
-    if args.center_policy_in is not None:
-        sd_c = torch.load(args.center_policy_in, map_location=gcfg.device)
-        per_c = int(sd_c["body.token_enc.weight"].shape[1])
-        glob_c = int(sd_c["body.glob_proj.weight"].shape[1])
-        center_policy = JointBandPolicy(
-            gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
-            use_cash_softmax=True,
-            global_dim=glob_c,
-            per_dim=per_c,
-        ).to(gcfg.device)
-        center_policy.load_state_dict(sd_c, strict=True)
-        center_policy.eval()
-        for p in center_policy.parameters():
-            p.requires_grad_(False)
-
-    center_policy = None
     if args.center_policy_in is not None and str(args.center_policy_in).strip() != "":
         center_policy = JointBandPolicy(
             gcfg.N_ASSETS, d_model=128, nlayers=2, nhead=4,
@@ -800,12 +785,12 @@ if __name__ == "__main__":
         policy, valuef, cfg, gcfg, R,
         lam_choices=lam_choices,
         target_choices=target_choices,
-        fine_tune_epochs=6,      # ★ここを5〜10で
-        width_prior_w=0.02,
+        fine_tune_epochs=10,      # ★ここを5〜10で
+        width_prior_w=0.00,
         mv_allow_cash=True,
         mv_solver="OSQP",
         qp_solver="OSQP",
-        topk = 2,
+        topk = 3,
         env_ctor=env_ctor,
         domain_randomize=True,
         market_sampler=(market_sampler if env_ctor is None else None),
