@@ -80,15 +80,18 @@ def main():
         # LQ / MV-style reward parameters
         ALLOW_CASH_IN_MV = False,
         MV_USE_TARGET = False,   # whether to use target return constraint in MV center
-        RISK_GAMMA = 0.0,
+        RISK_GAMMA = 5.0,
         TARGET_ETA = 0.0,        # eta in hinge penalty eta*[target - mu^T w]_+
-        REGIME_GAMMA_ON_OBS = True,
+        REGIME_GAMMA_ON_OBS = False,
         OBS_BETA_ZERO = True,
 
         ROLL_COV_SUMMARY_ON_OBS = True,
         ROLL_OBS_LOOKBACK = 21,
-        ROLL_TOP_EIGS = 4,
+        ROLL_TOP_EIGS = 2,
         ROLL_EWMA_HALFLIFE = 10,
+
+        OBS_SQRTDII_ON_OBS = True,
+        OBS_ASSET_DOWNSIDE_DEV_ON_OBS = True
         )
     
     # --- episode-level regime randomization ---
@@ -99,6 +102,7 @@ def main():
     globalcfg.REGIME_CORR_NOISE = 0.2      # additive noise on correlation matrix entries
     globalcfg.REGIME_BETA_CLIP = 0.999
     globalcfg.REGIME_SIGMA_CLIP = (1e-4, 10.0)
+
     set_seed(globalcfg.seed, globalcfg.device)
 
     # baseline R/Cov used for MV-center computations in rollout code

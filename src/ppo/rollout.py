@@ -718,6 +718,18 @@ def rollout_joint(
             Dii = compute_Dii(m_star, env.Cov)
             sqrtDii = np.sqrt(Dii / 252.0)
 
+            # ===== NEW: corr(s_i, sqrtDii) (per step) =====
+            # (guard: if std is ~0 then corr is ill-defined)
+            try:
+                if np.std(s_np) > 1e-12 and np.std(sqrtDii) > 1e-12:
+                    c = float(np.corrcoef(s_np, sqrtDii)[0, 1])
+                else:
+                    c = float("nan")
+            except Exception:
+                c = float("nan")
+            # store per-step then average at episode end
+            diag.setdefault("_corr_step", []).append(c)
+
             sqrtDii_mean_list.append(float(np.mean(sqrtDii)))
             sqrtDii_med_list.append(float(np.median(sqrtDii)))
             sqrtDii_max_list.append(float(np.max(sqrtDii)))
@@ -838,7 +850,13 @@ def rollout_joint(
             diag.setdefault("absdev_mean", []).append(float(np.mean(absdev_mean_list)))
             diag.setdefault("absdev_med",  []).append(float(np.mean(absdev_med_list)))
             diag.setdefault("absdev_max",  []).append(float(np.mean(absdev_max_list)))
-
+            # ===== NEW: summarize corr(s, sqrtDii) per episode =====
+            if "_corr_step" in diag and len(diag["_corr_step"]) > 0:
+                cc = np.asarray(diag["_corr_step"], float)
+                cc = cc[np.isfinite(cc)]
+                diag.setdefault("corr_s_sqrtDii_mean", []).append(float(np.mean(cc)) if cc.size else float("nan"))
+                diag["_corr_step"].clear()
+        
         if out_minm is not None:
             for k0, v0 in out_minm.items():
                 diag_ep[k0].append(v0)
@@ -884,6 +902,17 @@ def rollout_joint(
     sqrtDii_med = float(np.mean(diag["sqrtDii_med"])) if len(diag["sqrtDii_med"]) > 0 else 0.0
     sqrtDii_max = float(np.mean(diag["sqrtDii_max"])) if len(diag["sqrtDii_max"]) > 0 else 0.0
     print(f"sqrtDii mean: {sqrtDii_mean:.6e}, median: {sqrtDii_med:.6e}, max: {sqrtDii_max:.6e}")
+
+    # ===== NEW: batch-level diagnostics print =====
+    if len(diag.get("R_off_mean", [])) > 0:
+        print("[R dbg] offdiag mean/std (avg over eps) = "
+              f"{float(np.mean(diag['R_off_mean'])):.4f} / {float(np.mean(diag['R_off_std'])):.4f}")
+        print("[R dbg] eigmin/cond (avg over eps) = "
+              f"{float(np.mean(diag['R_eigmin'])):.3e} / {float(np.mean(diag['R_cond'])):.3e}")
+
+    if len(diag.get("corr_s_sqrtDii_mean", [])) > 0:
+        print("[learn dbg] corr(s, sqrtDii) mean over eps = "
+              f"{float(np.nanmean(diag['corr_s_sqrtDii_mean'])):.4f}")
 
     gappostmean = float(np.mean(diag.get("gap_post_mean", [0.0]))) if len(diag.get("gap_post_mean", [])) > 0 else 0.0
     gaptopkmean = float(np.mean(diag.get("gap_topk_mean", [0.0]))) if len(diag.get("gap_topk_mean", [])) > 0 else 0.0

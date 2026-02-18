@@ -978,37 +978,37 @@ def main() -> None:
     use_cash = bool(args.policy_use_cash_softmax) and (not bool(args.policy_no_cash_softmax))
 
 
-# ------------------------------------------------------------
-# Load policy checkpoint(s) and sync env obs flags to match them
-# ------------------------------------------------------------
-K = int(len(regimes)) if regimes is not None else 0
+    # ------------------------------------------------------------
+    # Load policy checkpoint(s) and sync env obs flags to match them
+    # ------------------------------------------------------------
+    K = int(len(regimes)) if regimes is not None else 0
 
-# policy A
-policy_A, per_dim_A, global_dim_A = load_policy(
-    args.policy_path,
-    N=int(args.N),
-    device=device,
-    d_model=args.policy_d_model,
-    nlayers=args.policy_nlayers,
-    nhead=args.policy_nhead,
-    use_cash_softmax=bool(use_cash),
-)
-_apply_obs_flags_from_dims(gcfg, per_dim=per_dim_A, global_dim=global_dim_A, K=K)
-
-# optional policy B (force same dims as A, to keep the evaluation comparable)
-policy_B = None
-if args.policy_path_B:
-    policy_B, per_dim_B, global_dim_B = load_policy(
-        args.policy_path_B,
+    # policy A
+    policy_A, per_dim_A, global_dim_A = load_policy(
+        args.policy_path,
         N=int(args.N),
         device=device,
         d_model=args.policy_d_model,
         nlayers=args.policy_nlayers,
         nhead=args.policy_nhead,
         use_cash_softmax=bool(use_cash),
-        per_dim=per_dim_A,
-        global_dim=global_dim_A,
     )
+    _apply_obs_flags_from_dims(gcfg, per_dim=per_dim_A, global_dim=global_dim_A, K=K)
+
+    # optional policy B (force same dims as A, to keep the evaluation comparable)
+    policy_B = None
+    if args.policy_path_B:
+        policy_B, per_dim_B, global_dim_B = load_policy(
+            args.policy_path_B,
+            N=int(args.N),
+            device=device,
+            d_model=args.policy_d_model,
+            nlayers=args.policy_nlayers,
+            nhead=args.policy_nhead,
+            use_cash_softmax=bool(use_cash),
+            per_dim=per_dim_A,
+            global_dim=global_dim_A,
+        )
 
     outroot = Path(args.outdir)
     outroot.mkdir(parents=True, exist_ok=True)

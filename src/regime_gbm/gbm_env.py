@@ -56,6 +56,13 @@ class globalsetting:
     # threshold in dt units: 0.0 means downside relative to 0 return (log-return approx).
     # If you want "below target", you can set this True and use target_ret_dt as threshold.
     ROLL_DOWNSIDE_USE_TARGET: bool = False
+    # === NEW: per-asset extra obs features ===
+    # Add one per-asset token feature: sqrt(Dii/252) computed from Cov_hat (or true Cov)
+    OBS_SQRTDII_ON_OBS: bool = False
+    # Add one per-asset token feature: downside deviation of asset i's realized log-return
+    # dd_i = sqrt(E[min(0, r_i - tau)^2]) / sqrt(dt)  (annualized-like)
+    OBS_ASSET_DOWNSIDE_DEV_ON_OBS: bool = False
+    OBS_ASSET_DOWNSIDE_USE_TARGET: bool = False
  
     # ---- derived dims (filled in __post_init__) ----
     PER_ASSET_DIM: int = 0
@@ -65,14 +72,19 @@ class globalsetting:
         # per-asset token dims:
         #   base: [beta, w, sigma, Rw, lam] -> 5
         #   if ROLL_COV_SUMMARY_ON_OBS: add [sigma_hat, mu_hat] -> +2
-        self.PER_ASSET_DIM = 7 if self.ROLL_COV_SUMMARY_ON_OBS else 5
+        #self.PER_ASSET_DIM = 7 if self.ROLL_COV_SUMMARY_ON_OBS else 5
+        per = (7 if self.ROLL_COV_SUMMARY_ON_OBS else 5)
+        if bool(getattr(self, "OBS_SQRTDII_ON_OBS", False)):
+            per += 1
+        if bool(getattr(self, "OBS_ASSET_DOWNSIDE_DEV_ON_OBS", False)):
+            per += 1
+        self.PER_ASSET_DIM = int(per)
  
         # global dims appended when ROLL_COV_SUMMARY_ON_OBS:
         #   roll_global: [trace, cond] + topk eigenvalues -> 2 + ROLL_TOP_EIGS
         # plus optional downside deviation ddp -> +1
         add_dd = 1 if (self.ROLL_COV_SUMMARY_ON_OBS and self.ROLL_DOWNSIDE_DEV_ON_OBS) else 0
         self.ROLL_GLOBAL_DIM = (2 + int(self.ROLL_TOP_EIGS) + add_dd) if self.ROLL_COV_SUMMARY_ON_OBS else 0
-  
 
 def reflect_multi(S: np.ndarray,
                   C: float,
@@ -332,64 +344,6 @@ def _rotbox_stats_line(prefix: str = "[RotBoxQP]") -> str:
         f"opt_inacc={s['opt_inacc']} fail={s['fail']}"
     )
 
-
-def project_rotated_box_qp_old(
-    w: np.ndarray,
-    m: np.ndarray,
-    U: np.ndarray,
-    b_z: np.ndarray,
-    *,
-    allow_cash: bool = True,
-    solver: str = "OSQP",
-) -> np.ndarray:
-    """
-    Projection of w onto rotated box:
-        |U^T (u - m)| <= b_z, u>=0, sum(u)<=1 (cash) or ==1 (no cash)
-    """
-    w = np.asarray(w, float).reshape(-1)
-    m = np.asarray(m, float).reshape(-1)
-    U = np.asarray(U, float)
-    b_z = np.asarray(b_z, float).reshape(-1)
-    n = w.size
-
-    u = cp.Variable(n)
-    z = U.T @ (u - m)
-
-    obj = cp.Minimize(0.5 * cp.sum_squares(u - w))
-    cons = [u >= 0, z <= b_z, z >= -b_z]
-    cons += [cp.sum(u) <= 1.0] if allow_cash else [cp.sum(u) == 1.0]
-
-    prob = cp.Problem(obj, cons)
-    try:
-        prob.solve(
-            solver=cp.OSQP,
-            verbose=False,
-            warm_start=True,
-            eps_abs=1e-7,
-            eps_rel=1e-7,
-            max_iter=200000,
-            polish=True,
-        )
-        #prob.solve(solver=getattr(cp, solver), verbose=False, warm_start=True)
-    except Exception:
-        prob.solve(solver=cp.SCS, verbose=False)
-
-    if u.value is None:
-        # fallback: do nothing
-        return w.copy()
-
-    out = np.array(u.value, dtype=float).reshape(-1)
-    out = clamp01_vec(out)
-    # optional: enforce sum constraint softly (avoid numerical glitches)
-    s = float(out.sum())
-    if allow_cash:
-        if s > 1.0 + 1e-10:
-            out /= max(s, 1e-12)
-    else:
-        if s > 1e-12:
-            out /= s
-    return out
-
 def project_rotated_box_qp(
     w: np.ndarray,
     m: np.ndarray,
@@ -638,7 +592,6 @@ class GBMBandEnvMulti:
 
     def _make_obs(self):
         """
-        per-asset token features: [beta_i, w_i, sigma_i, (R@w)_i, lam]
         global features base: [lam, target_ret_dt, port_var, ||R w||]
         optionally append regime gamma (soft probs): [gamma_0,...,gamma_{K-1}]
         """
@@ -658,6 +611,7 @@ class GBMBandEnvMulti:
         sigma_hat = sigma.copy()
         mu_hat = np.zeros(self.N, dtype=float)
         roll_global = None
+        Cov_hat = None
 
         #if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
         #    lb   = int(getattr(self.cfg, "ROLL_OBS_LOOKBACK", 63))
@@ -737,23 +691,67 @@ class GBMBandEnvMulti:
                 top = np.full(topk, np.nan)
 
             roll_global = np.concatenate([[tr, cond], np.asarray(top, float)], axis=0)
+        else:
+            Cov_hat = self.Cov
 
         port_var = float(w @ self.Cov @ w)
         rw_norm = float(np.linalg.norm(Rw))
         #per_asset = np.stack([beta, w, sigma, Rw, np.full_like(beta, lam_scalar)], axis=0).T  # [N,5]
         #per_asset_flat = per_asset.reshape(-1)                                             # [N*5]
         #base = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
-        if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
-            per_asset = np.stack(
-                [beta, w, sigma, Rw, np.full_like(beta, lam_scalar), sigma_hat, mu_hat],
-                axis=0
-            ).T  # [N,7]
-        else:
+        #if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
+        #    per_asset = np.stack(
+        #        [beta, w, sigma, Rw, np.full_like(beta, lam_scalar), sigma_hat, mu_hat],
+        #        axis=0
+        #    ).T  # [N,7]
+        #else:
             # [beta, w, sigma, Rw, lam] -> 5 dims
-            per_asset = np.stack(
-                [beta, w, sigma, Rw, np.full_like(beta, lam_scalar)],
-                axis=0
-            ).T  # [N,5]
+        #    per_asset = np.stack(
+        #        [beta, w, sigma, Rw, np.full_like(beta, lam_scalar)],
+        #        axis=0
+        #    ).T  # [N,5]
+        # --- NEW: optional per-asset features ---
+        # sqrtDii_hat: computed from Cov_hat (rolling) and current weights w
+        sqrtDii_hat = None
+        if bool(getattr(self.cfg, "OBS_SQRTDII_ON_OBS", False)):
+            try:
+                C = np.asarray(Cov_hat, float)
+                Cw = C @ w
+                wCw = float(w @ Cw)
+                Dii_hat = (w**2) * (np.diag(C) - 2.0 * Cw + wCw)
+                Dii_hat = np.maximum(Dii_hat, 0.0)
+                sqrtDii_hat = np.sqrt(Dii_hat / 252.0)
+            except Exception:
+                sqrtDii_hat = np.zeros(self.N, dtype=float)
+        # asset downside deviation (annualized-like) from realized log returns
+        dd_asset = None
+        if bool(getattr(self.cfg, "OBS_ASSET_DOWNSIDE_DEV_ON_OBS", False)):
+            lb = int(getattr(self.cfg, "ROLL_OBS_LOOKBACK", 63))
+            dd_asset = np.zeros(self.N, dtype=float)
+            try:
+                if hasattr(self, "_ret_hist") and len(self._ret_hist) >= 2:
+                    win = np.asarray(self._ret_hist[-lb:], float)  # [L,N]
+                    if win.ndim == 2 and win.shape[0] >= 2:
+                        if bool(getattr(self.cfg, "OBS_ASSET_DOWNSIDE_USE_TARGET", False)):
+                            # threshold in dt units (log-return approx)
+                            tau = float(self.target_ret_dt)
+                        else:
+                            tau = 0.0
+                        x = np.minimum(0.0, win - tau)            # [L,N]
+                        dd_asset = np.sqrt(np.mean(x*x, axis=0)) / np.sqrt(max(self.dt, 1e-12))
+            except Exception:
+                dd_asset = np.zeros(self.N, dtype=float)
+
+        # --- assemble per-asset token matrix ---
+        cols = [beta, w, sigma, Rw, np.full_like(beta, lam_scalar)]
+        if bool(getattr(self.cfg, "ROLL_COV_SUMMARY_ON_OBS", False)):
+            cols += [sigma_hat, mu_hat]
+        if sqrtDii_hat is not None:
+            cols += [sqrtDii_hat]
+        if dd_asset is not None:
+            cols += [dd_asset]
+        per_asset = np.stack(cols, axis=0).T
+        
         per_asset_flat = per_asset.reshape(-1)
         base = np.array([lam_scalar, float(self.target_ret_dt), port_var, rw_norm], float)
         if roll_global is not None:

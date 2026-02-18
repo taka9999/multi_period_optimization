@@ -2161,11 +2161,13 @@ if __name__ == "__main__":
         RISK_GAMMA = 0.0,
         TARGET_ETA = 0.0,        # eta in hinge penalty eta*[target - mu^T w]_+
         REGIME_GAMMA_ON_OBS = False,
-        OBS_BETA_ZERO = False,
+        OBS_BETA_ZERO = True,
 
         ROLL_COV_SUMMARY_ON_OBS = True,
         ROLL_OBS_LOOKBACK = 21,
         ROLL_TOP_EIGS = 5,
+        OBS_SQRTDII_ON_OBS = True,
+        OBS_ASSET_DOWNSIDE_DEV_ON_OBS = True
     )
     # --- episode-level regime randomization ---
     # Each episode samples {beta_k, sigmas_k, R_k} for all regimes and keeps them fixed within the episode.

@@ -606,13 +606,15 @@ if __name__ == "__main__":
         MV_USE_TARGET = False,   # whether to use target return constraint in MV center
         RISK_GAMMA = 0.0,
         TARGET_ETA = 0.0,        # eta in hinge penalty eta*[target - mu^T w]_+
-        REGIME_GAMMA_ON_OBS = True,
+        REGIME_GAMMA_ON_OBS = False,
         OBS_BETA_ZERO = True,
 
         ROLL_COV_SUMMARY_ON_OBS = True,
         ROLL_OBS_LOOKBACK = 21,
-        ROLL_TOP_EIGS = 3,
+        ROLL_TOP_EIGS = 2,
         ROLL_EWMA_HALFLIFE = 10,
+        OBS_SQRTDII_ON_OBS = True,
+        OBS_ASSET_DOWNSIDE_DEV_ON_OBS = True
     )
 
     cfg = PPOConfig(
@@ -624,10 +626,10 @@ if __name__ == "__main__":
         minibatch_size=4096,
         lr_actor=1e-4,
         lr_critic=1e-3,
-        lr_actor2=1e-4,
-        lr_critic2=1e-3,
-        clip_ratio=0.5,
-        entropy_coef=0.3,
+        lr_actor2=7e-5,
+        lr_critic2=7e-4,
+        clip_ratio=0.4,
+        entropy_coef=0.2,
         vf_coef=0.5,
         max_grad_norm=0.5,
     )
@@ -790,7 +792,7 @@ if __name__ == "__main__":
         mv_allow_cash=True,
         mv_solver="OSQP",
         qp_solver="OSQP",
-        topk = 3,
+        topk = 1,
         env_ctor=env_ctor,
         domain_randomize=True,
         market_sampler=(market_sampler if env_ctor is None else None),
